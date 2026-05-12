@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { useAvatar } from "@/lib/avatar-store";
 import { getPalette } from "@/lib/emotion-palette";
+import { BrainNetwork } from "./avatar/BrainNetwork";
 import { CoreOrb } from "./avatar/CoreOrb";
 import { ParticleField } from "./avatar/ParticleField";
 
@@ -94,7 +95,8 @@ export function KaiAvatar({ forceLowPower = false }: Props) {
     const mobile =
       forceLowPower ||
       window.matchMedia("(max-width: 768px), (pointer: coarse)").matches;
-    setParticleCount(mobile ? 4500 : 12000);
+    // Slightly lower counts than v2 so the brain network reads cleanly.
+    setParticleCount(mobile ? 3000 : 8000);
     setDpr(mobile ? [1, 1.5] : [1, 2]);
   }, [forceLowPower]);
 
@@ -104,7 +106,7 @@ export function KaiAvatar({ forceLowPower = false }: Props) {
       style={{ opacity: visible ? 1 : 0 }}
     >
       <Canvas
-        camera={{ position: [0, 0, 4.2], fov: 45 }}
+        camera={{ position: [0, 0, 6.0], fov: 45 }}
         gl={{
           antialias: false,
           alpha: true,
@@ -116,8 +118,9 @@ export function KaiAvatar({ forceLowPower = false }: Props) {
         <ambientLight intensity={0.05} />
         <CameraRig />
         <PaletteBackdrop />
+        <ParticleField count={particleCount} radius={1.05} />
         <CoreOrb />
-        <ParticleField count={particleCount} />
+        <BrainNetwork />
 
         <EffectComposer multisampling={0}>
           <Bloom
