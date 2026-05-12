@@ -11,31 +11,53 @@ import * as THREE from "three";
 import { useAvatar } from "@/lib/avatar-store";
 import { REGIONS } from "@/lib/brain-regions";
 
-const NODE_COUNT = 320;
-const K_NEAREST = 5; // each node connects to 5 nearest = ~1200 unique edges
-const EDGE_SEGMENTS = 9; // points along each bezier curve → smooth, not angular
+const NODE_COUNT = 800;
+const K_NEAREST = 5; // each node connects to 5 nearest = ~2000 unique edges
+const EDGE_SEGMENTS = 8; // points along each bezier curve → smooth, not angular
 const VERTS_PER_EDGE = EDGE_SEGMENTS * 2; // line segments need 2 verts each
-const ELLIPSOID = { x: 1.65, y: 1.35, z: 1.15 };
-const DRIFT_AMP = 0.075;
+// Slightly elongated front-to-back, with a thin sagittal fissure splitting
+// the cloud into two hemispheres (see brainShapedPoint below).
+const ELLIPSOID = { x: 1.55, y: 1.35, z: 1.7 };
+const DRIFT_AMP = 0.06;
 
 // ---- Helpers ----------------------------------------------------------------
 
-function ellipsoidPoint(): [number, number, number] {
-  // Uniform-ish point inside a unit ball, then map to ellipsoid.
-  let x = 0,
-    y = 0,
-    z = 0,
-    d = 2;
-  while (d > 1) {
-    x = Math.random() * 2 - 1;
-    y = Math.random() * 2 - 1;
-    z = Math.random() * 2 - 1;
-    d = x * x + y * y + z * z;
+function brainShapedPoint(): [number, number, number] {
+  // Sample in unit ball, map to ellipsoid, then apply two anatomical tweaks:
+  // (1) bias density to the outer shell (cortex), (2) thin out the sagittal
+  // plane to create a soft longitudinal fissure separating two hemispheres.
+  for (let tries = 0; tries < 30; tries++) {
+    let x = 0,
+      y = 0,
+      z = 0,
+      d = 2;
+    while (d > 1) {
+      x = Math.random() * 2 - 1;
+      y = Math.random() * 2 - 1;
+      z = Math.random() * 2 - 1;
+      d = x * x + y * y + z * z;
+    }
+    // Cortical density bias — most nodes live near the outer surface.
+    const r = Math.cbrt(d) * (0.7 + Math.random() * 0.3);
+    const inv = r / Math.max(Math.sqrt(d), 1e-6);
+    let px = x * inv * ELLIPSOID.x;
+    let py = y * inv * ELLIPSOID.y;
+    let pz = z * inv * ELLIPSOID.z;
+
+    // Longitudinal fissure: reject most samples near the x=0 plane to create
+    // a thin gap between hemispheres. Falls off quickly with distance.
+    const xNorm = Math.abs(px) / ELLIPSOID.x;
+    const fissureKeep = 1 - Math.exp(-(xNorm * xNorm) / 0.012) * 0.85;
+    if (Math.random() > fissureKeep) continue;
+
+    // Subtle ventral curve — frontal lobe slightly lower at the front.
+    if (pz > 0.4) {
+      py -= (pz - 0.4) * 0.08;
+    }
+
+    return [px, py, pz];
   }
-  // Bias outward a bit so the cloud has visible "skin".
-  const r = Math.cbrt(d) * (0.55 + Math.random() * 0.45);
-  const inv = r / Math.max(Math.sqrt(d), 1e-6);
-  return [x * inv * ELLIPSOID.x, y * inv * ELLIPSOID.y, z * inv * ELLIPSOID.z];
+  return [0, 0, 0];
 }
 
 function generateNodes() {
@@ -48,7 +70,7 @@ function generateNodes() {
   );
 
   for (let i = 0; i < NODE_COUNT; i++) {
-    const [x, y, z] = ellipsoidPoint();
+    const [x, y, z] = brainShapedPoint();
     positions.push(new THREE.Vector3(x, y, z));
     seeds[i] = Math.random() * 1000;
 
@@ -152,6 +174,39 @@ function buildCurvedEdgeGeometry(
   return { positions, colors, edgeInfo, tValues, edgeCount };
 }
 
+// ---- Glowing-orb shader for nodes ------------------------------------------
+
+const ORB_VERTEX = /* glsl */ `
+attribute float aSize;
+varying vec3 vColor;
+void main() {
+  vColor = color;
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  gl_Position = projectionMatrix * mv;
+  // Size attenuates with distance so closer orbs are larger.
+  gl_PointSize = aSize * (340.0 / max(-mv.z, 0.0001));
+  gl_PointSize = clamp(gl_PointSize, 1.0, 60.0);
+}
+`;
+
+const ORB_FRAGMENT = /* glsl */ `
+precision highp float;
+varying vec3 vColor;
+void main() {
+  // Circular sprite with bright center, soft glowing falloff.
+  vec2 uv = gl_PointCoord - 0.5;
+  float d = length(uv);
+  if (d > 0.5) discard;
+  // Two-layer falloff: hot core + outer halo.
+  float core = smoothstep(0.5, 0.0, d);
+  float halo = pow(core, 2.0);
+  float hotCenter = smoothstep(0.18, 0.0, d);
+  vec3 col = vColor * (1.0 + hotCenter * 0.8);
+  float alpha = (core * 0.55 + halo * 0.55);
+  gl_FragColor = vec4(col, alpha);
+}
+`;
+
 // ---- The cloud --------------------------------------------------------------
 
 function NeuralGraph() {
@@ -186,6 +241,7 @@ function NeuralGraph() {
     [graph.basePositions],
   );
   const nodeColors = useMemo(() => new Float32Array(NODE_COUNT * 3), []);
+  const nodeSizes = useMemo(() => new Float32Array(NODE_COUNT), []);
   const edgeColors = graph.edgeGeo.colors;
 
   // Smoothed region activations.
@@ -256,9 +312,13 @@ function NeuralGraph() {
       nodeColors[i * 3] = Math.min(1, rc.r * baseBrightness + whiteMix);
       nodeColors[i * 3 + 1] = Math.min(1, rc.g * baseBrightness + whiteMix);
       nodeColors[i * 3 + 2] = Math.min(1, rc.b * baseBrightness + whiteMix);
+
+      // Size grows with activation + sparkles with pulse.
+      nodeSizes[i] = 0.05 + pulse * 0.025 + act * 0.13;
     }
     nodes.geometry.attributes.position.needsUpdate = true;
     nodes.geometry.attributes.color.needsUpdate = true;
+    nodes.geometry.attributes.aSize.needsUpdate = true;
 
     // 2) Edge colors — gradient between endpoint region colors, brightness =
     //    avg activation. Cascade fires add white-hot brightness.
@@ -384,15 +444,19 @@ function NeuralGraph() {
             args={[nodeColors, 3]}
             count={NODE_COUNT}
           />
+          <bufferAttribute
+            attach="attributes-aSize"
+            args={[nodeSizes, 1]}
+            count={NODE_COUNT}
+          />
         </bufferGeometry>
-        <pointsMaterial
+        <shaderMaterial
+          vertexShader={ORB_VERTEX}
+          fragmentShader={ORB_FRAGMENT}
           vertexColors
-          size={0.13}
           transparent
-          opacity={0.95}
-          sizeAttenuation
-          blending={THREE.AdditiveBlending}
           depthWrite={false}
+          blending={THREE.AdditiveBlending}
           toneMapped={false}
         />
       </points>
