@@ -64,10 +64,11 @@ const CHARS_PER_SEC = 14.0;
 // is still a real ticker.
 const TICKER_BLOCKLIST = new Set([
   "A", "I", "IT", "NO", "OK", "OR", "AND", "THE", "ON", "IS", "BE", "US",
-  "MY", "ME", "GO",
+  "MY", "ME", "GO", "HI", "HEY", "OH", "AH", "YO", "LOL", "OMG", "WTF",
+  "IDK", "TBH", "IMO", "BTW", "FYI", "LMK", "NVM", "RIP", "AF", "ASAP",
 ]);
 const TICKER_RE_FILLER = /\b\$?[A-Z]{2,5}\b/;
-const TICKER_RE_CLASSIFIER = /(?:\$[A-Z]{1,5}\b|\b[A-Z]{1,5}\b)/;
+const TICKER_RE_CLASSIFIER = /(?:\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b)/;
 
 /** True if `msg` contains a probable stock ticker (not in the blocklist). */
 function hasTicker(msg: string, re: RegExp): boolean {
@@ -121,7 +122,7 @@ const DATA_KEYWORDS = [
   "watchlist", "alert", "alerts", "position", "portfolio", "setup", "entry",
   "target", "stop loss", "chart", "level", "support", "resistance",
   "breakout", "macd", "rsi", "ema", "vwap", "volume", "earnings", "dividend",
-  "today", "tomorrow", "this week", "gap up", "gap down", "premarket",
+  "tomorrow", "this week", "gap up", "gap down", "premarket",
   "aftermarket", "news on", "what's happening with", "show me", "pull up",
   "scan", "screen", "find me", "bias", "recap",
 ];
