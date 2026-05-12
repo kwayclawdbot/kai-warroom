@@ -70,6 +70,35 @@ const TICKER_BLOCKLIST = new Set([
 const TICKER_RE_FILLER = /\b\$?[A-Z]{2,5}\b/;
 const TICKER_RE_CLASSIFIER = /(?:\$[A-Z]{1,5}\b|\b[A-Z]{2,5}\b)/;
 
+/**
+ * Known tickers and major company names — matched case-insensitively so we
+ * catch lowercase ticker mentions like "hows nvda". Users naturally type
+ * lowercase, and the uppercase regex above misses every such case.
+ */
+const KNOWN_TICKERS_LOWER = new Set([
+  // megacaps
+  "aapl", "msft", "nvda", "googl", "goog", "meta", "amzn", "tsla", "brk",
+  "avgo", "jpm", "wmt", "xom", "orcl", "nflx", "adbe", "amd", "crm", "intc",
+  // ETFs / indices / vol
+  "spy", "qqq", "iwm", "dia", "vti", "voo", "tlt", "gld", "slv", "uso",
+  "vix", "uvxy", "vxx", "spxl", "tqqq", "sqqq",
+  // user's hot names (from memory)
+  "poet", "mram", "ionq", "rklb", "plug", "nok", "pltr",
+  // common active names
+  "coin", "mara", "riot", "sofi", "dash", "abnb", "rblx", "shop", "sq",
+  "pypl", "uber", "lyft", "snap", "pins", "roku", "crwd", "panw", "zs",
+  "snow", "ddog", "net", "mdb", "twlo", "okta", "afrm", "bill", "hood",
+  "carv", "lcid", "nio", "xpev", "li", "baba", "jd", "pdd", "boil", "kold",
+  // crypto-adjacent
+  "btc", "eth",
+]);
+
+const COMPANY_NAMES_LOWER = new Set([
+  "tesla", "nvidia", "apple", "microsoft", "google", "alphabet", "meta",
+  "facebook", "amazon", "netflix", "intel", "amd", "salesforce", "oracle",
+  "palantir", "rocket lab", "coinbase", "robinhood", "shopify",
+]);
+
 /** True if `msg` contains a probable stock ticker (not in the blocklist). */
 function hasTicker(msg: string, re: RegExp): boolean {
   const matches = msg.match(new RegExp(re.source, "g"));
@@ -130,6 +159,15 @@ const DATA_KEYWORDS = [
 function classifyIntent(message: string): "data" | "casual" {
   if (hasTicker(message, TICKER_RE_CLASSIFIER)) return "data";
   const m = message.toLowerCase();
+  // Case-insensitive ticker check against known list — catches "hows nvda".
+  for (const t of KNOWN_TICKERS_LOWER) {
+    if (new RegExp(`\\b${t}\\b`).test(m)) return "data";
+  }
+  // Company names ("tesla", "nvidia", "apple") → data path so Kai pulls real
+  // quotes instead of riffing from training data.
+  for (const name of COMPANY_NAMES_LOWER) {
+    if (m.includes(name)) return "data";
+  }
   for (const kw of DATA_KEYWORDS) {
     if (m.includes(kw)) return "data";
   }
@@ -157,7 +195,13 @@ Rules:
 - Energy is EAGER and warm, not laid-back or jaded. You want to help him win.
 - Contractions always. Conversational pace. Fragments fine.
 - One or two sentences. If he wants more, he'll ask.
-- If he asks anything that needs actual market data (tickers, prices, alerts, watchlist, levels, setups), say "hold on Kway, pulling that up" and stop — the full Kai brain takes over from there.`;
+- ANSWER every question with your best take. NEVER say "hold on, switching"
+  or "let me pull that up" or "give me a second" — those are bridging phrases
+  that imply you'll come back with data, and you won't. The full Kai brain
+  handles tickers/prices/alerts/watchlist on a separate path; here, you just
+  answer conversationally with whatever you know. If the question genuinely
+  needs real-time data you can't provide, give a general take and tell him
+  to ask more specifically (mention a ticker or say "show me my watchlist").`;
 
 const VOICE_INSTRUCTIONS = `Voice: Kway's personal market analyst — warm, professional, eager to help him win. Mid-thirties, sharp, energetic. Think: the best financial advisor you've ever talked to, the kind who's actually FUN to call.
 
