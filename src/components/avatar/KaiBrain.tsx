@@ -284,17 +284,10 @@ function NeuralGraph() {
     const intensity = state2.intensity;
     const bass = state2.bass;
 
-    // Constant swirl — runs regardless of audio/region state.
+    // Constant swirl — runs regardless of audio/region state. The whole brain
+    // stays the same size; speech is expressed via nodes, not group scale.
     grp.rotation.y = t * 0.05;
     grp.rotation.x = Math.sin(t * 0.035) * 0.12;
-
-    // Speech-driven breathing scale: bass + intensity expand the whole brain
-    // gently in time with syllables.
-    const targetScale = 1.0 + bass * 0.05 + intensity * 0.035;
-    const currentScale = grp.scale.x;
-    grp.scale.setScalar(
-      currentScale + (targetScale - currentScale) * Math.min(1, delta * 8),
-    );
 
     // Smooth region activations from store.
     const k = Math.min(1, delta * 5);
@@ -310,35 +303,44 @@ function NeuralGraph() {
       }
     }
 
-    // 1) Node drift + color.
+    // 1) Node drift + color. Speech speeds up both flicker and drift so the
+    //    nodes appear to fire faster during talking — but the cloud as a
+    //    whole stays the same size.
+    const flickerRate = 4.8 + intensity * 5.5; // ~5 rad/s idle, ~10 rad/s loud
+    const driftSpeed = 1.0 + intensity * 1.2 + bass * 0.6;
     for (let i = 0; i < NODE_COUNT; i++) {
       const seed = graph.seeds[i];
       const region = graph.regions[i];
       const act = regionActSmooth.current[region];
-      const pulse = Math.sin(t * 1.1 + seed * 0.7) * 0.5 + 0.5;
+      const pulse = Math.sin(t * flickerRate + seed * 0.7) * 0.5 + 0.5;
 
-      // Independent drift — each node moves on its own sine path.
+      // Independent drift — each node moves on its own sine path. Drift speed
+      // ramps with speech so the cloud shimmers faster when talking.
       nodePositions[i * 3] =
         graph.basePositions[i * 3] +
-        Math.sin(t * 0.25 + seed) * DRIFT_AMP;
+        Math.sin(t * 0.25 * driftSpeed + seed) * DRIFT_AMP;
       nodePositions[i * 3 + 1] =
         graph.basePositions[i * 3 + 1] +
-        Math.cos(t * 0.21 + seed * 1.3) * DRIFT_AMP;
+        Math.cos(t * 0.21 * driftSpeed + seed * 1.3) * DRIFT_AMP;
       nodePositions[i * 3 + 2] =
         graph.basePositions[i * 3 + 2] +
-        Math.sin(t * 0.19 + seed * 0.7) * DRIFT_AMP * 0.7;
+        Math.sin(t * 0.19 * driftSpeed + seed * 0.7) * DRIFT_AMP * 0.7;
 
-      // Region-colored node: dim baseline, brighter + slightly hotter on activation.
+      // Region-colored node: dim baseline, brighter + slightly hotter on
+      // activation, and a global glow boost driven by speech intensity so the
+      // whole cloud "lights up" on every syllable.
       const rc = REGIONS[region].color;
-      const baseBrightness = 0.45 + pulse * 0.18 + act * 0.55;
-      // Add a touch of white at activation peak for hot-center feel.
-      const whiteMix = act * 0.18 * pulse;
+      const glowBoost = intensity * 0.4 + bass * 0.15;
+      const baseBrightness = 0.4 + pulse * 0.22 + act * 0.6 + glowBoost;
+      // Add a touch of white at activation peak + speech crest for hot-center.
+      const whiteMix = act * 0.18 * pulse + intensity * 0.18 * pulse;
       nodeColors[i * 3] = Math.min(1, rc.r * baseBrightness + whiteMix);
       nodeColors[i * 3 + 1] = Math.min(1, rc.g * baseBrightness + whiteMix);
       nodeColors[i * 3 + 2] = Math.min(1, rc.b * baseBrightness + whiteMix);
 
-      // Size grows with activation + sparkles with pulse + global speech boost.
-      nodeSizes[i] = 0.05 + pulse * 0.025 + act * 0.13 + intensity * 0.035;
+      // Size grows with activation + small flicker — keep speech boost subtle
+      // so node sizes don't visibly swell across the whole cloud.
+      nodeSizes[i] = 0.05 + pulse * 0.022 + act * 0.13 + intensity * 0.012;
     }
     nodes.geometry.attributes.position.needsUpdate = true;
     nodes.geometry.attributes.color.needsUpdate = true;
