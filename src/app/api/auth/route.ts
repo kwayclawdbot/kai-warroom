@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { SESSION_COOKIE, SESSION_MAX_AGE, signSession } from "@/lib/session";
+import { createClient } from "@/lib/supabase/server";
 import { clientIp, rateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: Request) {
@@ -8,47 +8,42 @@ export async function POST(req: Request) {
   if (!rl.ok) {
     return NextResponse.json(
       { error: "Too many attempts — slow down" },
-      {
-        status: 429,
-        headers: { "Retry-After": String(rl.retryAfterSec) },
-      },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
     );
   }
 
-  const expectedUser = process.env.SHARED_USERNAME;
-  const expectedPass = process.env.SHARED_PASSWORD;
-  const secret = process.env.SESSION_SECRET;
-  if (!expectedUser || !expectedPass || !secret) {
-    return NextResponse.json(
-      { error: "Server not configured" },
-      { status: 500 },
-    );
-  }
-  let body: { username?: string; password?: string };
+  let body: { email?: string; password?: string };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid body" }, { status: 400 });
   }
-  if (
-    !body.username ||
-    !body.password ||
-    body.username !== expectedUser ||
-    body.password !== expectedPass
-  ) {
+  const email = body.email?.trim().toLowerCase();
+  const password = body.password;
+  if (!email || !password) {
     return NextResponse.json(
-      { error: "Wrong username or password" },
+      { error: "Email and password required" },
+      { status: 400 },
+    );
+  }
+
+  const supabase = await createClient();
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) {
+    return NextResponse.json(
+      { error: error.message || "Login failed" },
       { status: 401 },
     );
   }
-  const token = await signSession(secret);
-  const res = NextResponse.json({ ok: true });
-  res.cookies.set(SESSION_COOKIE, token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-    maxAge: SESSION_MAX_AGE,
-  });
-  return res;
+
+  // Best-effort lazy linker: matches auth.uid() → public.users by email so
+  // subsequent kai_user_tier() / chat route lookups can resolve the SMS user
+  // record. RPC is defined in cheatcode-os Supabase (kai_link_auth_user).
+  try {
+    await supabase.rpc("kai_link_auth_user");
+  } catch {
+    /* link is idempotent; first hit may fail, that's fine */
+  }
+
+  return NextResponse.json({ ok: true });
 }

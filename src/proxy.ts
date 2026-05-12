@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { SESSION_COOKIE, verifySession } from "@/lib/session";
+import { refreshSupabaseSession } from "@/lib/supabase/middleware-helper";
 
 export const config = {
   matcher: [
@@ -8,13 +8,9 @@ export const config = {
 };
 
 export async function proxy(req: NextRequest) {
-  const secret = process.env.SESSION_SECRET;
-  if (!secret) {
-    return new NextResponse("SESSION_SECRET not configured", { status: 500 });
-  }
-  const cookie = req.cookies.get(SESSION_COOKIE)?.value;
-  const ok = await verifySession(secret, cookie);
-  if (ok) return NextResponse.next();
+  const { response, user } = await refreshSupabaseSession(req);
+  if (user) return response;
+
   const url = req.nextUrl.clone();
   url.pathname = "/login";
   url.searchParams.set("from", req.nextUrl.pathname);

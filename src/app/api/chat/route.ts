@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 import { clientIp, rateLimit } from "@/lib/rate-limit";
+import { createClient as createSupabaseClient } from "@/lib/supabase/server";
 
 // Wired to the live kai-agent on Railway (cheatcode-ai.up.railway.app).
 //
@@ -156,7 +157,37 @@ const DATA_KEYWORDS = [
   "scan", "screen", "find me", "bias", "recap",
 ];
 
+/**
+ * Single-word answers to Kai's clarification questions ("Quick take, full
+ * breakdown, or a specific angle — technical, fundamental, or catalysts?").
+ * Without this carve-out, "technical" routes to the casual path and dies
+ * because gpt-4o-mini has no ticker context from the prior turn.
+ */
+const CLARIFICATION_RESPONSES = new Set([
+  "quick", "quick take", "quickly", "brief", "briefly",
+  "full", "full breakdown", "everything", "all of it", "the whole thing",
+  "deep dive", "deep", "more",
+  "technical", "technicals", "ta", "chart", "charts",
+  "fundamental", "fundamentals", "story", "the story",
+  "catalyst", "catalysts", "news", "events",
+]);
+
+function isClarificationResponse(message: string): boolean {
+  const m = message.trim().toLowerCase().replace(/[.!?,]+$/, "");
+  if (m.length > 30) return false;
+  if (CLARIFICATION_RESPONSES.has(m)) return true;
+  // Also match "give me the X" / "go X" / "lets do X" framings up to 30 chars
+  for (const key of CLARIFICATION_RESPONSES) {
+    if (new RegExp(`\\b${key}\\b`).test(m)) return true;
+  }
+  return false;
+}
+
 function classifyIntent(message: string): "data" | "casual" {
+  // Clarification answers MUST hit the data path — kai-agent reads the
+  // previous turn from conversation_history to find which ticker/question
+  // this is answering.
+  if (isClarificationResponse(message)) return "data";
   if (hasTicker(message, TICKER_RE_CLASSIFIER)) return "data";
   const m = message.toLowerCase();
   // Case-insensitive ticker check against known list — catches "hows nvda".
@@ -291,7 +322,6 @@ export async function POST(req: Request) {
 
   const agentUrl = process.env.KAI_AGENT_URL;
   const agentToken = process.env.KAI_AVATAR_TOKEN;
-  const userId = process.env.KAI_USER_ID;
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!openaiKey) {
     return NextResponse.json(
@@ -330,15 +360,34 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+
+  // Resolve the authenticated user's phone → kai-agent's user_id. Middleware
+  // (src/proxy.ts) has already enforced an authenticated session, so getUser
+  // should succeed; the public.users row may still be missing if the lazy
+  // linker hasn't matched the email yet.
+  const supabase = await createSupabaseClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
+  }
+  const { data: row } = await supabase
+    .from("users")
+    .select("phone")
+    .eq("auth_user_id", user.id)
+    .maybeSingle();
+  const userId = row?.phone;
   if (!userId) {
     return NextResponse.json(
       {
         error:
-          "KAI_USER_ID not set — add the phone of your kai-agent user via Vercel env",
+          "no kai user linked to this account — sign in with the email tied to your SMS subscription",
       },
-      { status: 500 },
+      { status: 403 },
     );
   }
+
   return streamData(openai, message, {
     agentUrl,
     agentToken,

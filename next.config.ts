@@ -14,7 +14,7 @@ const CSP = [
   "media-src 'self' blob:",
   "worker-src 'self' blob:",
   "font-src 'self' data:",
-  "connect-src 'self' https://cheatcode-ai.up.railway.app https://api.openai.com",
+  "connect-src 'self' https://cheatcode-ai.up.railway.app https://api.openai.com https://ryprohqthwflinadqotj.supabase.co wss://ryprohqthwflinadqotj.supabase.co",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
