@@ -4,11 +4,14 @@ import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
 import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
+import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
 
 const KaiBrain = dynamic(
   () => import("@/components/avatar/KaiBrain").then((m) => m.KaiBrain),
   { ssr: false },
 );
+
+type DemoMode = "off" | "thinking" | "speaking";
 
 type ThoughtBeat = {
   at: number;
@@ -32,50 +35,42 @@ const ANALYSIS_SEQUENCE: ThoughtBeat[] = [
 ];
 const SEQUENCE_PERIOD_MS = 13000;
 
+const MODE_LABELS: Record<DemoMode, string> = {
+  off: "Demo · off",
+  thinking: "Demo · thinking",
+  speaking: "Demo · speaking",
+};
+
+function nextMode(m: DemoMode): DemoMode {
+  if (m === "off") return "thinking";
+  if (m === "thinking") return "speaking";
+  return "off";
+}
+
 export default function Home() {
   const setIntensity = useAvatar((s) => s.setIntensity);
   const setBands = useAvatar((s) => s.setBands);
+  const startSpeaking = useAvatar((s) => s.startSpeaking);
+  const stopSpeaking = useAvatar((s) => s.stopSpeaking);
   const pulseRegion = useAvatar((s) => s.pulseRegion);
   const clearRegions = useAvatar((s) => s.clearRegions);
 
-  const [demoOn, setDemoOn] = useState(true);
-  const demoOnRef = useRef(demoOn);
-  demoOnRef.current = demoOn;
+  const [mode, setMode] = useState<DemoMode>("speaking");
+  const [currentPhrase, setCurrentPhrase] = useState<string | null>(null);
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
 
-  // Subtle audio bands — drives slow breathing on the cloud.
+  // ─── Thinking mode: scripted analysis sequence (no audio) ──────────────
   useEffect(() => {
-    if (!demoOn) {
-      setIntensity(0);
-      setBands(0, 0, 0);
-      return;
-    }
-    let raf = 0;
-    const start = performance.now();
-    const tick = () => {
-      const t = (performance.now() - start) / 1000;
-      setIntensity(0.4 + 0.25 * Math.sin(t * 1.7));
-      setBands(
-        Math.pow(Math.max(0, Math.sin(t * 4.4)), 4) * 0.85,
-        0.35 + 0.4 * (0.5 + 0.5 * Math.sin(t * 4.1 + 1.3)),
-        0,
-      );
-      if (demoOnRef.current) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [demoOn, setIntensity, setBands]);
-
-  // Thought sequence — pulses regions in a believable thinking pattern.
-  useEffect(() => {
-    if (!demoOn) {
-      clearRegions();
-      return;
-    }
+    if (mode !== "thinking") return;
     const timeouts: number[] = [];
+    setIntensity(0);
+    setBands(0, 0, 0);
+    stopSpeaking();
     const runCycle = () => {
       for (const beat of ANALYSIS_SEQUENCE) {
         const id = window.setTimeout(() => {
-          if (!demoOnRef.current) return;
+          if (modeRef.current !== "thinking") return;
           pulseRegion(beat.id, beat.peak, beat.decayMs);
         }, beat.at * 1000);
         timeouts.push(id);
@@ -88,7 +83,89 @@ export default function Home() {
       for (const id of timeouts) window.clearTimeout(id);
       clearRegions();
     };
-  }, [demoOn, pulseRegion, clearRegions]);
+  }, [
+    mode,
+    pulseRegion,
+    clearRegions,
+    setIntensity,
+    setBands,
+    stopSpeaking,
+  ]);
+
+  // ─── Speaking mode: phrase program with syllable-driven audio bands ────
+  useEffect(() => {
+    if (mode !== "speaking") return;
+    startSpeaking();
+
+    let raf = 0;
+    let entryIdx = 0;
+    let entryStart = performance.now();
+    const pulsedSet = new Set<number>();
+    setCurrentPhrase(
+      SPEECH_PROGRAM[0].kind === "phrase" ? SPEECH_PROGRAM[0].text : null,
+    );
+
+    const tick = () => {
+      if (modeRef.current !== "speaking") return;
+      const now = performance.now();
+      const entry = SPEECH_PROGRAM[entryIdx];
+      const elapsed = (now - entryStart) / 1000;
+
+      if (elapsed >= entry.duration) {
+        // Advance.
+        entryIdx = (entryIdx + 1) % SPEECH_PROGRAM.length;
+        entryStart = now;
+        pulsedSet.clear();
+        const next = SPEECH_PROGRAM[entryIdx];
+        setCurrentPhrase(next.kind === "phrase" ? next.text : null);
+      } else if (entry.kind === "phrase") {
+        const env = speakingEnvelope(elapsed);
+        setIntensity(env.intensity);
+        setBands(env.bass, env.mid, env.treble);
+        // Fire region pulses at their scheduled fractional offsets.
+        entry.regions.forEach((r, i) => {
+          if (!pulsedSet.has(i) && elapsed >= r.at * entry.duration) {
+            pulsedSet.add(i);
+            pulseRegion(r.id, r.peak, r.decayMs ?? 1800);
+          }
+        });
+      } else {
+        // Pause — fade audio out quickly.
+        setIntensity(0);
+        setBands(0, 0, 0);
+      }
+
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      stopSpeaking();
+      setIntensity(0);
+      setBands(0, 0, 0);
+      clearRegions();
+      setCurrentPhrase(null);
+    };
+  }, [
+    mode,
+    setIntensity,
+    setBands,
+    startSpeaking,
+    stopSpeaking,
+    pulseRegion,
+    clearRegions,
+  ]);
+
+  // ─── Off mode cleanup ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (mode !== "off") return;
+    setIntensity(0);
+    setBands(0, 0, 0);
+    stopSpeaking();
+    clearRegions();
+    setCurrentPhrase(null);
+  }, [mode, setIntensity, setBands, stopSpeaking, clearRegions]);
 
   return (
     <main className="relative flex-1 overflow-hidden bg-[#05080A] text-white">
@@ -97,12 +174,12 @@ export default function Home() {
           kai · brain
         </div>
         <div className="flex flex-col items-end gap-1 text-[10px] uppercase tracking-[0.2em] text-amber-200/70 font-mono">
-          <div>v0.2 · scroll to zoom · drag to orbit</div>
+          <div>v0.3 · scroll to zoom · drag to orbit</div>
           <button
-            onClick={() => setDemoOn((v) => !v)}
-            className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/55 transition hover:border-white/40 hover:text-white"
+            onClick={() => setMode(nextMode)}
+            className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white"
           >
-            {demoOn ? "Pause demo" : "Resume demo"}
+            {MODE_LABELS[mode]}
           </button>
         </div>
       </header>
@@ -110,6 +187,10 @@ export default function Home() {
       <KaiBrain />
 
       <footer className="absolute bottom-0 left-0 right-0 z-10 flex flex-col items-center gap-3 px-4 pb-6 pt-3 pointer-events-none">
+        {/* Caption strip — shows what Kai is currently "saying" */}
+        <div className="min-h-[1rem] font-mono text-[11px] uppercase tracking-[0.18em] text-amber-100/75">
+          {currentPhrase ?? ""}
+        </div>
         <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-white/30">
           tap a region to fire it manually
         </div>
@@ -119,11 +200,6 @@ export default function Home() {
               key={r.id}
               onClick={() => pulseRegion(r.id, 1.0, 2400)}
               className="font-mono rounded-sm border border-white/10 bg-black/40 px-2.5 py-1 text-[10px] uppercase tracking-[0.22em] text-white/55 backdrop-blur transition hover:text-white"
-              style={
-                {
-                  ["--hover-color" as string]: `#${r.color.getHexString()}`,
-                } as React.CSSProperties
-              }
             >
               <span
                 className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle"

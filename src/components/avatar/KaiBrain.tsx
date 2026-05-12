@@ -280,12 +280,23 @@ function NeuralGraph() {
     const edges = edgesRef.current;
     if (!grp || !nodes || !edges) return;
 
+    const state2 = useAvatar.getState();
+    const intensity = state2.intensity;
+    const bass = state2.bass;
+
     // Constant swirl — runs regardless of audio/region state.
     grp.rotation.y = t * 0.05;
     grp.rotation.x = Math.sin(t * 0.035) * 0.12;
 
+    // Speech-driven breathing scale: bass + intensity expand the whole brain
+    // gently in time with syllables.
+    const targetScale = 1.0 + bass * 0.05 + intensity * 0.035;
+    const currentScale = grp.scale.x;
+    grp.scale.setScalar(
+      currentScale + (targetScale - currentScale) * Math.min(1, delta * 8),
+    );
+
     // Smooth region activations from store.
-    const state2 = useAvatar.getState();
     const k = Math.min(1, delta * 5);
     let maxAct = 0;
     let hotRegion = -1;
@@ -326,8 +337,8 @@ function NeuralGraph() {
       nodeColors[i * 3 + 1] = Math.min(1, rc.g * baseBrightness + whiteMix);
       nodeColors[i * 3 + 2] = Math.min(1, rc.b * baseBrightness + whiteMix);
 
-      // Size grows with activation + sparkles with pulse.
-      nodeSizes[i] = 0.05 + pulse * 0.025 + act * 0.13;
+      // Size grows with activation + sparkles with pulse + global speech boost.
+      nodeSizes[i] = 0.05 + pulse * 0.025 + act * 0.13 + intensity * 0.035;
     }
     nodes.geometry.attributes.position.needsUpdate = true;
     nodes.geometry.attributes.color.needsUpdate = true;
@@ -357,9 +368,10 @@ function NeuralGraph() {
       }
     }
 
-    // 3) Synapse cascades — probability ramps with max activation. Cascade
-    //    walks a short chain of connected edges with stagger and decay.
-    const fireRate = 0.05 + maxAct * 0.18;
+    // 3) Synapse cascades — probability ramps with max activation AND with
+    //    speech intensity (so the brain looks visibly more active when Kai
+    //    is talking). Cascade walks a short chain with stagger and decay.
+    const fireRate = 0.05 + maxAct * 0.18 + intensity * 0.18;
     if (Math.random() < fireRate) {
       // Pick origin node: bias toward the hot region's nodes.
       let originNode = Math.floor(Math.random() * NODE_COUNT);
