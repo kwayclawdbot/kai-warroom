@@ -304,10 +304,13 @@ function NeuralGraph() {
     }
 
     // 1) Node drift + color. Nodes themselves do NOT individually flicker.
-    //    The cloud as a whole has a synced ambient breath; speech is expressed
-    //    via line glow + faster synapse cascades, not per-node twinkling.
-    const ambientPulse = Math.sin(t * 1.5) * 0.5 + 0.5; // synced across all nodes
-    const globalGlow = ambientPulse * 0.08 + intensity * 0.45 + bass * 0.2;
+    //    Cloud has a constant moderate glow baseline + a slight ambient
+    //    breath + a small speech-driven lift. The speech pulse is subtle —
+    //    you should feel it without it being dramatic.
+    const ambientPulse = Math.sin(t * 1.5) * 0.5 + 0.5;
+    const ambientBaseline = 0.2 + ambientPulse * 0.04; // consistent moderate
+    const speechLift = intensity * 0.14 + bass * 0.06; // gentle
+    const globalGlow = ambientBaseline + speechLift;
     for (let i = 0; i < NODE_COUNT; i++) {
       const seed = graph.seeds[i];
       const region = graph.regions[i];
@@ -324,10 +327,11 @@ function NeuralGraph() {
         graph.basePositions[i * 3 + 2] +
         Math.sin(t * 0.19 + seed * 0.7) * DRIFT_AMP * 0.7;
 
-      // Region-colored node — dim baseline, brighter on region activation,
-      // plus the synced globalGlow lifts ALL nodes together on each syllable.
+      // Region-colored node — moderate constant glow, brighter on region
+      // activation, plus the gentle synced globalGlow lifts ALL nodes
+      // together on each syllable (subtle).
       const rc = REGIONS[region].color;
-      const brightness = 0.42 + act * 0.6 + globalGlow * 0.55;
+      const brightness = 0.55 + act * 0.55 + globalGlow * 0.45;
       // White-hot center mix only on region activation peaks (not speech).
       const whiteMix = act * 0.22;
       nodeColors[i * 3] = Math.min(1, rc.r * brightness + whiteMix);
@@ -342,11 +346,11 @@ function NeuralGraph() {
     nodes.geometry.attributes.aSize.needsUpdate = true;
 
     // 2) Edge colors — scale precomputed baseline gradient by per-edge
-    //    brightness. This is where the "global glow pulse" lives: every
-    //    line brightens together with speech intensity, making the internal
-    //    neuron network look like it's lighting up on each syllable.
+    //    brightness. Lines have a constant moderate baseline + a small
+    //    speech lift, so the synapse network is always visible but glows
+    //    a little brighter when Kai talks.
     const baselineColors = graph.edgeGeo.baselineColors;
-    const speechLineBoost = intensity * 0.55 + bass * 0.25;
+    const speechLineBoost = intensity * 0.14 + bass * 0.06;
     for (let e = 0; e < graph.edgeGeo.edgeCount; e++) {
       const ia = graph.edges[e][0];
       const ib = graph.edges[e][1];
@@ -357,8 +361,8 @@ function NeuralGraph() {
       const avgAct = (actA + actB) * 0.5;
       const sameRegion = ra === rb;
       const baseBrightness =
-        0.04 +
-        avgAct * (sameRegion ? 0.38 : 0.2) +
+        0.1 +
+        avgAct * (sameRegion ? 0.35 : 0.18) +
         (sameRegion ? 0.025 : 0) +
         speechLineBoost;
 
