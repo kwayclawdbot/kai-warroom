@@ -484,7 +484,7 @@ export function KaiBrain() {
         }}
       />
       <Canvas
-        camera={{ position: [0, 0, 3.2], fov: 50 }}
+        camera={{ position: [0, 0, 4.6], fov: 50 }}
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true }}
         style={{ background: "transparent" }}
@@ -494,8 +494,8 @@ export function KaiBrain() {
           enableDamping
           dampingFactor={0.06}
           enablePan={false}
-          minDistance={2.1}
-          maxDistance={6.5}
+          minDistance={3.0}
+          maxDistance={9}
           rotateSpeed={0.5}
           zoomSpeed={0.6}
         />
