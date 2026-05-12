@@ -4,21 +4,23 @@ import { clientIp, rateLimit } from "@/lib/rate-limit";
 
 // Wired to the live kai-agent on Railway (cheatcode-ai.up.railway.app).
 //
-// Flow:
-//   1. Pick a filler clip from the library based on a cheap keyword scan,
-//      and emit it as the FIRST event on the wire. The client preloads
-//      /audio/fillers/<id>.mp3 (a static asset, ~25KB) and plays it through
-//      the same audio queue as the real `audio_chunk` events — so the
-//      trader hears Kai start talking ~50ms after pressing send, while
-//      the kai-agent tool loop chugs (10–27s).
-//   2. Open SSE stream to kai-agent /api/chat/stream.
-//   3. Forward tool_start / tool_end events to the browser as NDJSON lines
-//      so the avatar can pulse regions in real time (instead of waiting ~27s
-//      for the blocking response).
-//   4. When the agent finishes (`reply` event), accumulate tool names →
-//      regions, split the reply into sentences, render each sentence through
-//      OpenAI TTS, and emit audio chunks as they're ready. Finally emit a
-//      `done` event.
+// Two paths, picked by `classifyIntent` (pure regex, no LLM call):
+//
+//   • DATA  — anything that looks like it needs Kai's tool loop (tickers,
+//     watchlist, alerts, "what's happening with…", etc). Routed to the
+//     kai-agent SSE stream. The agent loop takes 10–27s, so we emit a
+//     speculative filler mp3 the instant we start the upstream connection,
+//     pulse regions live as `tool_start` events arrive, and stream TTS per
+//     sentence once the reply comes back. Same flow as before.
+//
+//   • CASUAL — small talk, vibes, "hey what's up". Bypasses kai-agent
+//     entirely and streams a tight gpt-4o-mini completion directly (~1–2s
+//     to first audio). No tools, no regions, no filler — filler would
+//     overlap real audio on this fast path.
+//
+// Both paths emit the same NDJSON event contract (`tool_start`, `tool_end`,
+// `text`, `regions`, `audio_chunk`, `done`, `error`, `filler`) so the client
+// is path-agnostic.
 
 export const runtime = "nodejs";
 // Vercel Fluid Compute / streaming functions can run longer than the legacy
@@ -54,22 +56,20 @@ function toolToRegion(toolName: string): RegionId | null {
 
 const CHARS_PER_SEC = 14.0;
 
-// ───────────────────────── Filler library ─────────────────────────────────
+// ───────────────────────── Ticker / intent helpers ─────────────────────────
 //
-// Speculative filler clips synthesized once at build-time by
-// `scripts/generate-fillers.mjs`. The server picks the best id for the
-// user's question with a cheap keyword scan; the client fetches the static
-// mp3 and queues it before any real audio chunks arrive.
-
+// Ticker pattern: 1–5 uppercase letters, optional leading `$`, on a word
+// boundary. Filler matcher uses 2–5 to skip single-letter false positives
+// like "I"; classifier uses 1–5 since a single capital with `$` (e.g. "$F")
+// is still a real ticker.
 const TICKER_BLOCKLIST = new Set([
   "A", "I", "IT", "NO", "OK", "OR", "AND", "THE", "ON", "IS", "BE", "US",
   "MY", "ME", "GO",
 ]);
-// 2–5 uppercase letters with optional leading `$`, on a word boundary. Two
-// letters minimum here so we don't false-positive on "I", "A", etc when
-// picking a filler.
 const TICKER_RE_FILLER = /\b\$?[A-Z]{2,5}\b/;
+const TICKER_RE_CLASSIFIER = /(?:\$[A-Z]{1,5}\b|\b[A-Z]{1,5}\b)/;
 
+/** True if `msg` contains a probable stock ticker (not in the blocklist). */
 function hasTicker(msg: string, re: RegExp): boolean {
   const matches = msg.match(new RegExp(re.source, "g"));
   if (!matches) return false;
@@ -96,8 +96,8 @@ type FillerId =
 const RANDOM_FILLERS: FillerId[] = ["checking", "one_sec", "into_it"];
 
 /**
- * Heuristic match a filler clip to the user's question. Cheap keyword scan
- * — runs server-side so the same intent gets the same filler consistently.
+ * Heuristic match a filler clip to the user's question. Cheap keyword scan,
+ * picked server-side so the same intent gets the same filler consistently.
  */
 function pickFiller(message: string): FillerId {
   const m = message.toLowerCase();
@@ -111,6 +111,34 @@ function pickFiller(message: string): FillerId {
   }
   return RANDOM_FILLERS[Math.floor(Math.random() * RANDOM_FILLERS.length)];
 }
+
+// ─────────────────────────── Intent classifier ────────────────────────────
+//
+// Pure regex — zero LLM latency. Anything that looks like it wants real
+// market data goes to the kai-agent tool loop ("data"); everything else
+// falls through to the casual gpt-4o-mini path.
+const DATA_KEYWORDS = [
+  "watchlist", "alert", "alerts", "position", "portfolio", "setup", "entry",
+  "target", "stop loss", "chart", "level", "support", "resistance",
+  "breakout", "macd", "rsi", "ema", "vwap", "volume", "earnings", "dividend",
+  "today", "tomorrow", "this week", "gap up", "gap down", "premarket",
+  "aftermarket", "news on", "what's happening with", "show me", "pull up",
+  "scan", "screen", "find me", "bias", "recap",
+];
+
+function classifyIntent(message: string): "data" | "casual" {
+  if (hasTicker(message, TICKER_RE_CLASSIFIER)) return "data";
+  const m = message.toLowerCase();
+  for (const kw of DATA_KEYWORDS) {
+    if (m.includes(kw)) return "data";
+  }
+  return "casual";
+}
+
+// Casual path system prompt — keeps gpt-4o-mini tight, on-character, and
+// bounces back to the full Kai loop if the user actually wants data.
+const CASUAL_SYSTEM_PROMPT =
+  "You are Kai — a sharp, fast-paced market vibes coach speaking out loud to a trader on the desk. Keep responses to 1–2 sentences, conversational, no lists. Personality: direct, encouraging, occasionally cheeky. Never ask the user to clarify. If they ask for data, prices, alerts, watchlist info, or specific tickers, say 'Hold on — switching to full Kai mode' and stop there.";
 
 /**
  * Split text into sentence-sized chunks for sequential TTS rendering. Keeps
@@ -184,21 +212,6 @@ export async function POST(req: Request) {
   const agentToken = process.env.KAI_AVATAR_TOKEN;
   const userId = process.env.KAI_USER_ID;
   const openaiKey = process.env.OPENAI_API_KEY;
-  if (!agentUrl || !agentToken) {
-    return NextResponse.json(
-      { error: "KAI_AGENT_URL or KAI_AVATAR_TOKEN not configured" },
-      { status: 500 },
-    );
-  }
-  if (!userId) {
-    return NextResponse.json(
-      {
-        error:
-          "KAI_USER_ID not set — add the phone of your kai-agent user via Vercel env",
-      },
-      { status: 500 },
-    );
-  }
   if (!openaiKey) {
     return NextResponse.json(
       { error: "OPENAI_API_KEY not configured" },
@@ -217,21 +230,75 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "empty message" }, { status: 400 });
   }
 
-  // Pick a filler clip before opening the upstream. Emitted as the first
-  // NDJSON event below.
+  const intent = classifyIntent(message);
+  console.log(
+    `[chat] intent=${intent} msg=${JSON.stringify(message.slice(0, 80))}`,
+  );
+
+  const openai = new OpenAI({ apiKey: openaiKey });
+
+  // Casual path — bypass kai-agent entirely. ~1–2s to first audio.
+  if (intent === "casual") {
+    return streamCasual(openai, message);
+  }
+
+  // Data path — proxy to kai-agent, emit filler immediately.
+  if (!agentUrl || !agentToken) {
+    return NextResponse.json(
+      { error: "KAI_AGENT_URL or KAI_AVATAR_TOKEN not configured" },
+      { status: 500 },
+    );
+  }
+  if (!userId) {
+    return NextResponse.json(
+      {
+        error:
+          "KAI_USER_ID not set — add the phone of your kai-agent user via Vercel env",
+      },
+      { status: 500 },
+    );
+  }
+  return streamData(openai, message, {
+    agentUrl,
+    agentToken,
+    userId,
+  });
+}
+
+// ───────────────────────────── Data path ─────────────────────────────────
+
+interface AgentConfig {
+  agentUrl: string;
+  agentToken: string;
+  userId: string;
+}
+
+async function streamData(
+  openai: OpenAI,
+  message: string,
+  cfg: AgentConfig,
+): Promise<Response> {
+  // Pick a filler clip before we even open the upstream. The client preloads
+  // /audio/fillers/<id>.mp3 (a static asset, ~25KB) and plays it through the
+  // same audio queue as the real `audio_chunk` events — so the trader hears
+  // Kai start talking ~50ms after pressing send, while the tool loop chugs.
   const fillerId = pickFiller(message);
 
   // Connect to kai-agent's SSE endpoint.
   let upstream: Response;
   try {
-    upstream = await fetch(`${agentUrl}/api/chat/stream`, {
+    upstream = await fetch(`${cfg.agentUrl}/api/chat/stream`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${agentToken}`,
+        Authorization: `Bearer ${cfg.agentToken}`,
         Accept: "text/event-stream",
       },
-      body: JSON.stringify({ user_id: userId, message, channel: "avatar" }),
+      body: JSON.stringify({
+        user_id: cfg.userId,
+        message,
+        channel: "avatar",
+      }),
     });
   } catch (e) {
     const detail = e instanceof Error ? e.message : "unknown";
@@ -249,7 +316,6 @@ export async function POST(req: Request) {
   }
 
   const upstreamBody = upstream.body;
-  const openai = new OpenAI({ apiKey: openaiKey });
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -405,6 +471,111 @@ export async function POST(req: Request) {
       "Cache-Control": "no-cache, no-transform",
       "X-Content-Type-Options": "nosniff",
       // Disable proxy buffering (Vercel respects this).
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+// ──────────────────────────── Casual path ────────────────────────────────
+//
+// Streams a `gpt-4o-mini` chat completion, accumulates tokens into sentence
+// boundaries, and renders each completed sentence through OpenAI TTS-1.
+// No tool events, no regions — the brain pulses stay on their idle loop.
+
+async function streamCasual(
+  openai: OpenAI,
+  message: string,
+): Promise<Response> {
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let chunkIndex = 0;
+      let fullReply = "";
+
+      const renderSentence = async (sentence: string) => {
+        try {
+          const tts = await openai.audio.speech.create({
+            model: "tts-1",
+            voice: "onyx",
+            input: sentence,
+            response_format: "mp3",
+          });
+          const base64 = Buffer.from(await tts.arrayBuffer()).toString("base64");
+          controller.enqueue(
+            ndjson({
+              type: "audio_chunk",
+              index: chunkIndex,
+              base64,
+              mime: "audio/mpeg",
+              text: sentence,
+            }),
+          );
+          chunkIndex += 1;
+        } catch (e) {
+          const detail = e instanceof Error ? e.message : "unknown";
+          controller.enqueue(
+            ndjson({
+              type: "error",
+              message: `tts failed on sentence ${chunkIndex}: ${detail}`,
+            }),
+          );
+        }
+      };
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          stream: true,
+          messages: [
+            { role: "system", content: CASUAL_SYSTEM_PROMPT },
+            { role: "user", content: message },
+          ],
+        });
+
+        // Accumulate streamed tokens into a buffer. When the buffer contains
+        // a sentence-terminating punctuation followed by whitespace (or we
+        // hit end-of-stream), flush the completed sentence to TTS.
+        let pending = "";
+        for await (const chunk of completion) {
+          const delta = chunk.choices?.[0]?.delta?.content ?? "";
+          if (!delta) continue;
+          pending += delta;
+          fullReply += delta;
+
+          // Split on sentence boundaries; keep the last (potentially
+          // incomplete) piece in `pending`.
+          const pieces = pending.split(/(?<=[.!?])\s+/);
+          if (pieces.length > 1) {
+            const complete = pieces.slice(0, -1);
+            pending = pieces[pieces.length - 1];
+            for (const s of complete) {
+              const trimmed = s.trim();
+              if (trimmed) await renderSentence(trimmed);
+            }
+          }
+        }
+        const tail = pending.trim();
+        if (tail) await renderSentence(tail);
+
+        // Emit a `text` event with the full reply for any caption hand-off.
+        // Same shape as the data path so the client doesn't branch.
+        controller.enqueue(ndjson({ type: "text", text: fullReply.trim() }));
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : "unknown";
+        controller.enqueue(
+          ndjson({ type: "error", message: `casual stream failed: ${detail}` }),
+        );
+      }
+
+      controller.enqueue(ndjson({ type: "done", chunks: chunkIndex }));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      "X-Content-Type-Options": "nosniff",
       "X-Accel-Buffering": "no",
     },
   });
