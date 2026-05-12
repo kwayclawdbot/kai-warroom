@@ -5,11 +5,17 @@ import { clientIp, rateLimit } from "@/lib/rate-limit";
 // Wired to the live kai-agent on Railway (cheatcode-ai.up.railway.app).
 //
 // Flow:
-//   1. Open SSE stream to kai-agent /api/chat/stream.
-//   2. Forward tool_start / tool_end events to the browser as NDJSON lines
+//   1. Pick a filler clip from the library based on a cheap keyword scan,
+//      and emit it as the FIRST event on the wire. The client preloads
+//      /audio/fillers/<id>.mp3 (a static asset, ~25KB) and plays it through
+//      the same audio queue as the real `audio_chunk` events — so the
+//      trader hears Kai start talking ~50ms after pressing send, while
+//      the kai-agent tool loop chugs (10–27s).
+//   2. Open SSE stream to kai-agent /api/chat/stream.
+//   3. Forward tool_start / tool_end events to the browser as NDJSON lines
 //      so the avatar can pulse regions in real time (instead of waiting ~27s
 //      for the blocking response).
-//   3. When the agent finishes (`reply` event), accumulate tool names →
+//   4. When the agent finishes (`reply` event), accumulate tool names →
 //      regions, split the reply into sentences, render each sentence through
 //      OpenAI TTS, and emit audio chunks as they're ready. Finally emit a
 //      `done` event.
@@ -47,6 +53,64 @@ function toolToRegion(toolName: string): RegionId | null {
 }
 
 const CHARS_PER_SEC = 14.0;
+
+// ───────────────────────── Filler library ─────────────────────────────────
+//
+// Speculative filler clips synthesized once at build-time by
+// `scripts/generate-fillers.mjs`. The server picks the best id for the
+// user's question with a cheap keyword scan; the client fetches the static
+// mp3 and queues it before any real audio chunks arrive.
+
+const TICKER_BLOCKLIST = new Set([
+  "A", "I", "IT", "NO", "OK", "OR", "AND", "THE", "ON", "IS", "BE", "US",
+  "MY", "ME", "GO",
+]);
+// 2–5 uppercase letters with optional leading `$`, on a word boundary. Two
+// letters minimum here so we don't false-positive on "I", "A", etc when
+// picking a filler.
+const TICKER_RE_FILLER = /\b\$?[A-Z]{2,5}\b/;
+
+function hasTicker(msg: string, re: RegExp): boolean {
+  const matches = msg.match(new RegExp(re.source, "g"));
+  if (!matches) return false;
+  for (const m of matches) {
+    const sym = m.replace(/^\$/, "");
+    if (!TICKER_BLOCKLIST.has(sym)) return true;
+  }
+  return false;
+}
+
+/** Filler ids — keep in sync with public/audio/fillers/<id>.mp3. */
+type FillerId =
+  | "checking"
+  | "one_sec"
+  | "scanning"
+  | "pulling_up"
+  | "watchlist"
+  | "alerts"
+  | "tape"
+  | "ticker"
+  | "thinking"
+  | "into_it";
+
+const RANDOM_FILLERS: FillerId[] = ["checking", "one_sec", "into_it"];
+
+/**
+ * Heuristic match a filler clip to the user's question. Cheap keyword scan
+ * — runs server-side so the same intent gets the same filler consistently.
+ */
+function pickFiller(message: string): FillerId {
+  const m = message.toLowerCase();
+  if (hasTicker(message, TICKER_RE_FILLER)) return "ticker";
+  if (/\bwatchlist\b/.test(m)) return "watchlist";
+  if (/\balerts?\b/.test(m)) return "alerts";
+  if (/\b(setup|chart|level)\b/.test(m)) return "pulling_up";
+  if (/what do you think|should i\b/.test(m)) return "thinking";
+  if (/\b(market|today|tape)\b/.test(m)) {
+    return Math.random() < 0.5 ? "tape" : "scanning";
+  }
+  return RANDOM_FILLERS[Math.floor(Math.random() * RANDOM_FILLERS.length)];
+}
 
 /**
  * Split text into sentence-sized chunks for sequential TTS rendering. Keeps
@@ -153,6 +217,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "empty message" }, { status: 400 });
   }
 
+  // Pick a filler clip before opening the upstream. Emitted as the first
+  // NDJSON event below.
+  const fillerId = pickFiller(message);
+
   // Connect to kai-agent's SSE endpoint.
   let upstream: Response;
   try {
@@ -185,6 +253,16 @@ export async function POST(req: Request) {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // Filler MUST be the first event on the wire so the client can fetch
+      // and queue the mp3 while the tool loop runs.
+      controller.enqueue(
+        ndjson({
+          type: "filler",
+          id: fillerId,
+          url: `/audio/fillers/${fillerId}.mp3`,
+        }),
+      );
+
       const reader = upstreamBody.getReader();
       const decoder = new TextDecoder();
       let buf = "";

@@ -40,8 +40,27 @@ type ChatStreamEvent =
       duration_estimate_sec: number;
     }
   | { type: "audio_chunk"; index: number; base64: string; mime: string; text: string }
+  | { type: "filler"; id: string; url: string }
   | { type: "done"; chunks: number }
   | { type: "error"; message: string };
+
+/** Fetch a static filler mp3 and base64-encode it for the audio queue. */
+async function fetchFillerBase64(url: string): Promise<string> {
+  const res = await fetch(url, { cache: "force-cache" });
+  if (!res.ok) throw new Error(`filler fetch ${res.status}`);
+  const buf = await res.arrayBuffer();
+  // Browser-safe base64 encode of an ArrayBuffer.
+  let binary = "";
+  const bytes = new Uint8Array(buf);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + chunkSize)),
+    );
+  }
+  return btoa(binary);
+}
 
 const KaiBrain = dynamic(
   () => import("@/components/avatar/KaiBrain").then((m) => m.KaiBrain),
@@ -360,6 +379,22 @@ export default function Home() {
               case "audio_chunk":
                 audioQueue.push({ base64: evt.base64, text: evt.text });
                 break;
+              case "filler": {
+                // Fetch the static mp3 and queue it BEFORE any real audio
+                // chunks. Fire-and-forget — the player loop polls the queue
+                // every 30ms, so as soon as the filler resolves it plays.
+                const url = evt.url;
+                void fetchFillerBase64(url)
+                  .then((base64) => {
+                    audioQueue.push({ base64, text: "" });
+                  })
+                  .catch((err) => {
+                    // Filler is best-effort latency-cover. Failure is silent
+                    // — the real reply will still arrive.
+                    console.warn("[filler]", err);
+                  });
+                break;
+              }
               case "done":
                 streamState.ended = true;
                 break;
