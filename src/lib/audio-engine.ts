@@ -16,10 +16,13 @@ class AudioEngine {
   private analyser: AnalyserNode | null = null;
   private rafId: number | null = null;
 
-  // Playback (TTS).
-  private currentSource: MediaElementAudioSourceNode | null = null;
-  private currentAudio: HTMLAudioElement | null = null;
-  private currentObjectUrl: string | null = null;
+  // Playback (TTS). AudioBufferSourceNode is used (not <Audio> +
+  // MediaElementSource) because Safari refuses to play an Audio element
+  // when the gesture chain has been broken by async work (mic → STT → chat
+  // → play). Decoded buffers play through the AudioContext directly and
+  // are not gated by the autoplay policy once the context is resumed.
+  private currentBufferSource: AudioBufferSourceNode | null = null;
+  private currentEndedHandler: (() => void) | null = null;
 
   // Mic capture.
   private currentMicSource: MediaStreamAudioSourceNode | null = null;
@@ -50,74 +53,68 @@ class AudioEngine {
     if (ctx.state === "suspended") await ctx.resume();
   }
 
-  /** Play an mp3 (base64). AnalyserNode drives the avatar bands. */
-  async play(
-    audioBase64: string,
-    mime: string = "audio/mpeg",
-  ): Promise<HTMLAudioElement> {
+  /**
+   * Decode + play an mp3 (base64) through an AudioBufferSourceNode. Returns
+   * a promise that resolves when playback ends. AnalyserNode drives the bands.
+   */
+  async play(audioBase64: string): Promise<void> {
     const { ctx, analyser } = this.ensure();
     if (ctx.state === "suspended") await ctx.resume();
 
     this.stop();
     this.stopMic();
 
+    // Decode base64 → ArrayBuffer.
     const binary = atob(audioBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const blob = new Blob([bytes], { type: mime });
-    const url = URL.createObjectURL(blob);
 
-    const audio = new Audio(url);
-    audio.crossOrigin = "anonymous";
+    // decodeAudioData may detach the buffer on some browsers — copy it.
+    const arrayBuf = bytes.buffer.slice(0) as ArrayBuffer;
+    const audioBuffer: AudioBuffer = await new Promise((resolve, reject) => {
+      ctx.decodeAudioData(arrayBuf, resolve, reject);
+    });
 
-    const source = ctx.createMediaElementSource(audio);
-    source.connect(analyser);
-    source.connect(ctx.destination); // route to speakers too
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(analyser);
+    src.connect(ctx.destination);
 
-    this.currentAudio = audio;
-    this.currentSource = source;
-    this.currentObjectUrl = url;
-
-    await audio.play();
+    this.currentBufferSource = src;
     this.startBandReader();
 
-    audio.addEventListener(
-      "ended",
-      () => {
+    return new Promise<void>((resolve) => {
+      const onEnded = () => {
         this.cleanupBands();
-      },
-      { once: true },
-    );
-
-    return audio;
+        this.currentBufferSource = null;
+        this.currentEndedHandler = null;
+        resolve();
+      };
+      this.currentEndedHandler = onEnded;
+      src.onended = onEnded;
+      src.start(0);
+    });
   }
 
   stop() {
-    if (this.currentAudio) {
+    if (this.currentBufferSource) {
       try {
-        this.currentAudio.pause();
-        this.currentAudio.currentTime = 0;
+        this.currentBufferSource.onended = null;
+        this.currentBufferSource.stop();
       } catch {
         /* ignore */
       }
-    }
-    if (this.currentSource) {
       try {
-        this.currentSource.disconnect();
+        this.currentBufferSource.disconnect();
       } catch {
         /* ignore */
       }
+      this.currentBufferSource = null;
     }
-    if (this.currentObjectUrl) {
-      try {
-        URL.revokeObjectURL(this.currentObjectUrl);
-      } catch {
-        /* ignore */
-      }
+    if (this.currentEndedHandler) {
+      this.currentEndedHandler();
     }
-    this.currentAudio = null;
-    this.currentSource = null;
-    this.currentObjectUrl = null;
+    this.currentEndedHandler = null;
     if (!this.currentMicSource) this.cleanupBands();
   }
 
@@ -151,7 +148,7 @@ class AudioEngine {
       this.currentMicStream.getTracks().forEach((t) => t.stop());
       this.currentMicStream = null;
     }
-    if (!this.currentSource) this.cleanupBands();
+    if (!this.currentBufferSource) this.cleanupBands();
   }
 
   private cleanupBands() {

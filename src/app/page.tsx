@@ -244,20 +244,25 @@ export default function Home() {
           pulseTimeouts.push(id);
         });
 
-        const audio = await audioEngine.play(
-          data.audio_base64,
-          data.audio_mime ?? "audio/mpeg",
-        );
-        audio.addEventListener(
-          "ended",
-          () => {
+        // play() resolves when the decoded buffer finishes — clean up there.
+        audioEngine
+          .play(data.audio_base64)
+          .then(() => {
             for (const id of pulseTimeouts) window.clearTimeout(id);
             setChatPlaying(false);
             setCurrentPhrase(null);
             stopSpeaking();
-          },
-          { once: true },
-        );
+          })
+          .catch((err) => {
+            console.error("[playback]", err);
+            for (const id of pulseTimeouts) window.clearTimeout(id);
+            setChatPlaying(false);
+            setCurrentPhrase(null);
+            stopSpeaking();
+            setChatError(
+              err instanceof Error ? err.message : "playback failed",
+            );
+          });
       } catch (err) {
         console.error("[chat]", err);
         setChatError(err instanceof Error ? err.message : "send failed");
