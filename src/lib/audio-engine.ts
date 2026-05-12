@@ -28,6 +28,10 @@ class AudioEngine {
   private currentMicSource: MediaStreamAudioSourceNode | null = null;
   private currentMicStream: MediaStream | null = null;
 
+  // Pre-analyzed amplitude envelope for TTS playback (iOS Safari workaround
+  // — AnalyserNode returns zeros on AudioBufferSourceNode there).
+  private envelopeRafId: number | null = null;
+
   private ensure() {
     if (this.ctx && this.analyser) {
       return { ctx: this.ctx, analyser: this.analyser };
@@ -77,14 +81,21 @@ class AudioEngine {
 
     const src = ctx.createBufferSource();
     src.buffer = audioBuffer;
-    src.connect(analyser);
+    // NOTE: NOT connecting to analyser here. iOS Safari's AnalyserNode
+    // returns all-zero data when fed from a BufferSource. We pre-compute
+    // the amplitude envelope from the decoded PCM data and drive the
+    // bands off ctx.currentTime instead — works on every device.
     src.connect(ctx.destination);
 
     this.currentBufferSource = src;
-    this.startBandReader();
+    this.startEnvelopeDriver(audioBuffer, ctx);
+    // Reference analyser so the unused-import lint doesn't complain
+    // (mic capture still uses it via startMic).
+    void analyser;
 
     return new Promise<void>((resolve, reject) => {
       const onEnded = () => {
+        this.stopEnvelopeDriver();
         this.cleanupBands();
         this.currentBufferSource = null;
         this.currentEndedHandler = null;
@@ -94,8 +105,6 @@ class AudioEngine {
       src.onended = onEnded;
       try {
         src.start(0);
-        // Safety net: if onended never fires (silent autoplay block),
-        // resolve after the buffer's natural duration + 500ms.
         window.setTimeout(
           () => {
             if (this.currentBufferSource === src) onEnded();
@@ -108,7 +117,72 @@ class AudioEngine {
     });
   }
 
+  /**
+   * Pre-compute the audio buffer's amplitude envelope (RMS per 33ms window),
+   * then drive the avatar's bass/mid/treble bands from it using
+   * ctx.currentTime as the playback clock. Independent of AnalyserNode, so
+   * works on iOS Safari where AnalyserNode is unreliable on BufferSources.
+   */
+  private startEnvelopeDriver(buffer: AudioBuffer, ctx: AudioContext) {
+    this.stopEnvelopeDriver();
+    const channelData = buffer.getChannelData(0);
+    const sr = buffer.sampleRate;
+    const windowMs = 33;
+    const windowSize = Math.max(1, Math.floor((sr * windowMs) / 1000));
+    const numWindows = Math.max(1, Math.floor(channelData.length / windowSize));
+    const env = new Float32Array(numWindows);
+    let peak = 0;
+    for (let i = 0; i < numWindows; i++) {
+      let sum = 0;
+      const start = i * windowSize;
+      for (let j = 0; j < windowSize; j++) {
+        const s = channelData[start + j];
+        sum += s * s;
+      }
+      const rms = Math.sqrt(sum / windowSize);
+      env[i] = rms;
+      if (rms > peak) peak = rms;
+    }
+    const norm = peak > 0 ? 1 / peak : 1;
+    const startCtxTime = ctx.currentTime;
+
+    const tick = () => {
+      const elapsed = ctx.currentTime - startCtxTime;
+      const idx = Math.floor((elapsed * 1000) / windowMs);
+      if (idx >= numWindows) {
+        this.envelopeRafId = null;
+        return;
+      }
+      const amp = Math.min(1, env[idx] * norm);
+      const prev = idx > 0 ? env[idx - 1] * norm : amp;
+      // Coarse band approximation from the amplitude curve:
+      // - bass: low-passed (moving avg of 3 windows)
+      // - mid:  the raw amplitude
+      // - treble: spike on rapid changes
+      let bassAvg = amp;
+      if (idx >= 2) {
+        bassAvg = (env[idx - 2] + env[idx - 1] + env[idx]) * norm * (1 / 3);
+      }
+      const trebleSpike = Math.min(1, Math.abs(amp - prev) * 2.5);
+
+      const s = useAvatar.getState();
+      s.setIntensity(amp);
+      s.setBands(bassAvg * 0.9, amp * 0.75, trebleSpike);
+
+      this.envelopeRafId = requestAnimationFrame(tick);
+    };
+    this.envelopeRafId = requestAnimationFrame(tick);
+  }
+
+  private stopEnvelopeDriver() {
+    if (this.envelopeRafId !== null) {
+      cancelAnimationFrame(this.envelopeRafId);
+      this.envelopeRafId = null;
+    }
+  }
+
   stop() {
+    this.stopEnvelopeDriver();
     if (this.currentBufferSource) {
       try {
         this.currentBufferSource.onended = null;
