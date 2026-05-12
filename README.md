@@ -29,10 +29,13 @@ Open <http://localhost:3000>, enter the password, see the avatar stub.
 
 | Name | Where set | Purpose |
 | --- | --- | --- |
+| `SHARED_USERNAME` | Vercel + local | Username for the War Room login gate |
 | `SHARED_PASSWORD` | Vercel + local | Password to enter the War Room (just Kway for now) |
 | `SESSION_SECRET` | Vercel + local | HMAC secret signing the session cookie. Generate with `openssl rand -hex 32` |
-| `NEXT_PUBLIC_BRAIN_API_URL` | Vercel + local | URL of the kai-warroom-brain service on Railway |
-| `NEXT_PUBLIC_DEEPGRAM_TOKEN_ENDPOINT` | Vercel + local | Path on the brain that mints short-lived Deepgram tokens |
+| `KAI_AGENT_URL` | Vercel + local | URL of the kai-agent service on Railway. Server-side only (no `NEXT_PUBLIC_`). |
+| `KAI_AVATAR_TOKEN` | Vercel + local | Bearer token for the kai-agent `/api/chat/stream` endpoint. |
+| `KAI_USER_ID` | Vercel + local | Phone (E.164) of the kai-agent user to chat as. |
+| `OPENAI_API_KEY` | Vercel + local | Server-side TTS (sentence-by-sentence) and Whisper STT for the mic. |
 
 ## Auth
 

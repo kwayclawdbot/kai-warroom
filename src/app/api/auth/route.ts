@@ -1,7 +1,20 @@
 import { NextResponse } from "next/server";
 import { SESSION_COOKIE, SESSION_MAX_AGE, signSession } from "@/lib/session";
+import { clientIp, rateLimit } from "@/lib/rate-limit";
 
 export async function POST(req: Request) {
+  // Rate limit: 5 login attempts per minute per IP.
+  const rl = rateLimit(`auth:${clientIp(req)}`, 5, 60_000);
+  if (!rl.ok) {
+    return NextResponse.json(
+      { error: "Too many attempts — slow down" },
+      {
+        status: 429,
+        headers: { "Retry-After": String(rl.retryAfterSec) },
+      },
+    );
+  }
+
   const expectedUser = process.env.SHARED_USERNAME;
   const expectedPass = process.env.SHARED_PASSWORD;
   const secret = process.env.SESSION_SECRET;

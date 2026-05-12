@@ -5,7 +5,43 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
 import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
-import { audioEngine, type ChatResponse } from "@/lib/audio-engine";
+import { audioEngine } from "@/lib/audio-engine";
+
+// Tool-name → region mapping mirrors the server-side map in
+// src/app/api/chat/route.ts so we can pulse a region the instant a
+// `tool_start` event arrives, without waiting for the final region schedule.
+function toolToRegion(toolName: string): RegionId | null {
+  const n = toolName.toLowerCase();
+  if (/(memor|recall|vault|history)/.test(n)) return "memory";
+  if (/(sector|market|regime|macro|tape|index)/.test(n)) return "market";
+  if (/(chart|snapshot|ticker|breakout|technical|score|pattern|level)/.test(n))
+    return "technicals";
+  if (/(alert|signal|winner)/.test(n)) return "alerts";
+  if (/(watchlist|saved|fav)/.test(n)) return "watchlist";
+  if (/(user|community|pulse|chatter|subscriber|sentiment)/.test(n))
+    return "users";
+  if (/(news|headline|story)/.test(n)) return "news";
+  if (/(option|flow|unusual|chain|strike)/.test(n)) return "options";
+  return null;
+}
+
+type ChatStreamEvent =
+  | { type: "tool_start"; name: string; args?: unknown }
+  | { type: "tool_end"; name: string; duration_ms: number }
+  | { type: "text"; text: string }
+  | {
+      type: "regions";
+      regions: Array<{
+        id: string;
+        peak: number;
+        decay_ms: number;
+        at_second: number;
+      }>;
+      duration_estimate_sec: number;
+    }
+  | { type: "audio_chunk"; index: number; base64: string; mime: string; text: string }
+  | { type: "done"; chunks: number }
+  | { type: "error"; message: string };
 
 const KaiBrain = dynamic(
   () => import("@/components/avatar/KaiBrain").then((m) => m.KaiBrain),
@@ -212,9 +248,51 @@ export default function Home() {
   const sendMessage = useCallback(
     async (message: string) => {
       if (!message.trim() || chatLoading || chatPlaying || !audioEngine) return;
+      // Demo loops cancel themselves via the chatPlaying / recording guards
+      // in their effect bodies — but we also flip mode to "off" so users
+      // don't see the demo state stuck in the header during a real turn.
+      if (modeRef.current !== "off") setMode("off");
+
       setChatError(null);
       setChatLoading(true);
+      clearRegions();
       await audioEngine.resume();
+
+      // Queue of audio chunks streamed in from the server. A single async
+      // task drains the queue and plays them sequentially through the audio
+      // engine; the server may still be rendering later sentences while the
+      // first sentence is playing.
+      const audioQueue: Array<{ base64: string; text: string }> = [];
+      const streamState = { ended: false };
+
+      const engine = audioEngine;
+      const drainAudioQueue = async () => {
+        try {
+          while (true) {
+            const next = audioQueue.shift();
+            if (!next) {
+              if (streamState.ended) break;
+              await new Promise((r) => setTimeout(r, 30));
+              continue;
+            }
+            if (!chatPlayingRef.current) {
+              setChatPlaying(true);
+              startSpeaking();
+            }
+            setCurrentPhrase(next.text);
+            try {
+              await engine.play(next.base64);
+            } catch (err) {
+              console.error("[playback chunk]", err);
+            }
+          }
+        } finally {
+          setChatPlaying(false);
+          setCurrentPhrase(null);
+          stopSpeaking();
+        }
+      };
+      const playerTask = drainAudioQueue();
 
       try {
         const res = await fetch("/api/chat", {
@@ -222,54 +300,97 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: message.trim() }),
         });
-        if (!res.ok) {
+        if (!res.ok || !res.body) {
           const body = await res
             .json()
             .catch(() => ({}) as { error?: string });
           throw new Error(body.error ?? `HTTP ${res.status}`);
         }
-        const data: ChatResponse = await res.json();
 
-        setChatPlaying(true);
-        clearRegions();
-        startSpeaking();
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
 
-        const pulseTimeouts: number[] = [];
-        data.regions.forEach((r) => {
-          if (!VALID_REGION_IDS.has(r.id)) return;
-          const id = window.setTimeout(() => {
-            pulseRegion(r.id as RegionId, r.peak, r.decay_ms);
-          }, Math.max(0, r.at_second * 1000));
-          pulseTimeouts.push(id);
-        });
+        // Stream pump: parse NDJSON line by line. Tool events pulse regions
+        // immediately; audio chunks queue for the player; `done` ends the
+        // stream loop.
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
 
-        // play() resolves when the decoded buffer finishes — clean up there.
-        audioEngine
-          .play(data.audio_base64)
-          .then(() => {
-            for (const id of pulseTimeouts) window.clearTimeout(id);
-            setChatPlaying(false);
-            setCurrentPhrase(null);
-            stopSpeaking();
-          })
-          .catch((err) => {
-            console.error("[playback]", err);
-            for (const id of pulseTimeouts) window.clearTimeout(id);
-            setChatPlaying(false);
-            setCurrentPhrase(null);
-            stopSpeaking();
-            setChatError(
-              err instanceof Error ? err.message : "playback failed",
-            );
-          });
+          let nl = buf.indexOf("\n");
+          while (nl !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            nl = buf.indexOf("\n");
+            if (!line) continue;
+            let evt: ChatStreamEvent;
+            try {
+              evt = JSON.parse(line) as ChatStreamEvent;
+            } catch {
+              console.warn("[chat] bad ndjson line:", line.slice(0, 120));
+              continue;
+            }
+            switch (evt.type) {
+              case "tool_start": {
+                const region = toolToRegion(evt.name);
+                if (region) pulseRegion(region, 0.9, 2200);
+                break;
+              }
+              case "tool_end":
+                break;
+              case "text":
+                // Reserved for future caption hand-off; currently the per-
+                // chunk `text` field drives the caption strip.
+                break;
+              case "regions":
+                // Fallback: if no tool_start events fired (e.g. cache hit),
+                // play out the scheduled regions so the avatar still moves.
+                if (evt.regions.length > 0) {
+                  evt.regions.forEach((r) => {
+                    if (!VALID_REGION_IDS.has(r.id)) return;
+                    window.setTimeout(
+                      () => pulseRegion(r.id as RegionId, r.peak, r.decay_ms),
+                      Math.max(0, r.at_second * 1000),
+                    );
+                  });
+                }
+                break;
+              case "audio_chunk":
+                audioQueue.push({ base64: evt.base64, text: evt.text });
+                break;
+              case "done":
+                streamState.ended = true;
+                break;
+              case "error":
+                throw new Error(evt.message);
+            }
+          }
+        }
+        // Flush any trailing partial line.
+        const tail = buf.trim();
+        if (tail) {
+          try {
+            const evt = JSON.parse(tail) as ChatStreamEvent;
+            if (evt.type === "audio_chunk") {
+              audioQueue.push({ base64: evt.base64, text: evt.text });
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        streamState.ended = true;
       } catch (err) {
         console.error("[chat]", err);
+        streamState.ended = true;
         setChatError(err instanceof Error ? err.message : "send failed");
-        setChatPlaying(false);
-        stopSpeaking();
       } finally {
         setChatLoading(false);
       }
+
+      // Wait until the player has drained the queue (or settled on error).
+      await playerTask;
     },
     [
       chatLoading,

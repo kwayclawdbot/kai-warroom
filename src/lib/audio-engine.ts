@@ -94,7 +94,10 @@ class AudioEngine {
     void analyser;
 
     return new Promise<void>((resolve, reject) => {
+      let resolved = false;
       const onEnded = () => {
+        if (resolved) return;
+        resolved = true;
         this.stopEnvelopeDriver();
         this.cleanupBands();
         this.currentBufferSource = null;
@@ -107,6 +110,7 @@ class AudioEngine {
         src.start(0);
         window.setTimeout(
           () => {
+            if (resolved) return;
             if (this.currentBufferSource === src) onEnded();
           },
           audioBuffer.duration * 1000 + 500,
@@ -115,6 +119,21 @@ class AudioEngine {
         reject(e);
       }
     });
+  }
+
+  /**
+   * Play a sequence of base64-encoded mp3 chunks back-to-back. Useful when
+   * the server streams TTS per sentence — each chunk drives its own
+   * amplitude envelope, and there's no overlap between sentences.
+   */
+  async playSequential(
+    chunks: Array<{ base64: string }>,
+    onChunkStart?: (index: number) => void,
+  ): Promise<void> {
+    for (let i = 0; i < chunks.length; i++) {
+      onChunkStart?.(i);
+      await this.play(chunks[i].base64);
+    }
   }
 
   /**
@@ -285,16 +304,3 @@ class AudioEngine {
 
 export const audioEngine =
   typeof window !== "undefined" ? new AudioEngine() : null;
-
-export type ChatResponse = {
-  text: string;
-  audio_base64: string;
-  audio_mime: string;
-  regions: Array<{
-    id: string;
-    peak: number;
-    decay_ms: number;
-    at_second: number;
-  }>;
-  duration_estimate_sec: number;
-};
