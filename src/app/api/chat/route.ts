@@ -310,63 +310,150 @@ interface AgentConfig {
   userId: string;
 }
 
+/**
+ * Generate a contextual 1-sentence acknowledgment that bridges the tool-loop
+ * latency. Runs in parallel with the kai-agent SSE call. Returns null on any
+ * failure so the data path can fall back to the static-mp3 filler library.
+ */
+async function generateContextualFiller(
+  openai: OpenAI,
+  message: string,
+): Promise<string | null> {
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      max_tokens: 50,
+      temperature: 0.9,
+      messages: [
+        {
+          role: "system",
+          content: `You're Kai — Kway's personal market analyst. The user just asked a market question; you have to bridge ~5 seconds of latency while real tools fetch the data. Generate ONE short sentence acknowledging their question warmly and saying you're pulling it up. DO NOT answer the question itself. DO NOT promise specific data points. Speak like a friend, address him as Kway when natural.
+
+Output ONLY Kai's bridging sentence, no quotes, no preamble.
+
+Examples:
+User: "what's NVDA doing?"
+Kai: Yeah Kway, NVDA's been one to watch — let me pull the levels real quick.
+
+User: "show me my watchlist"
+Kai: Good call, pulling your watchlist now — one sec.
+
+User: "any setups today?"
+Kai: On it. Let me scan for the cleanest names, give me a beat.
+
+User: "how's the tape look?"
+Kai: Yeah let me check the tape — gimme a second.
+
+User: "what's MRAM at?"
+Kai: Pulling MRAM right now, Kway.`,
+        },
+        { role: "user", content: message },
+      ],
+    });
+    const text = completion.choices[0]?.message?.content?.trim() || null;
+    if (!text || text.length < 4 || text.length > 200) return null;
+    return text;
+  } catch {
+    return null;
+  }
+}
+
 async function streamData(
   openai: OpenAI,
   message: string,
   cfg: AgentConfig,
 ): Promise<Response> {
-  // Pick a filler clip before we even open the upstream. The client preloads
-  // /audio/fillers/<id>.mp3 (a static asset, ~25KB) and plays it through the
-  // same audio queue as the real `audio_chunk` events — so the trader hears
-  // Kai start talking ~50ms after pressing send, while the tool loop chugs.
-  const fillerId = pickFiller(message);
-
-  // Connect to kai-agent's SSE endpoint.
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${cfg.agentUrl}/api/chat/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${cfg.agentToken}`,
-        Accept: "text/event-stream",
-      },
-      body: JSON.stringify({
-        user_id: cfg.userId,
-        message,
-        channel: "avatar",
-      }),
-    });
-  } catch (e) {
-    const detail = e instanceof Error ? e.message : "unknown";
-    return NextResponse.json(
-      { error: "kai-agent unreachable", detail },
-      { status: 502 },
-    );
-  }
-  if (!upstream.ok || !upstream.body) {
-    const detail = await upstream.text().catch(() => "");
-    return NextResponse.json(
-      { error: `kai-agent ${upstream.status}`, detail: detail.slice(0, 400) },
-      { status: 502 },
-    );
-  }
-
-  const upstreamBody = upstream.body;
+  // Kick off both kai-agent SSE AND the contextual filler generation in
+  // parallel. By the time filler audio is rendered (~1-1.3s), kai-agent has
+  // already been chewing tool calls for the same duration.
+  const upstreamPromise = fetch(`${cfg.agentUrl}/api/chat/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.agentToken}`,
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify({
+      user_id: cfg.userId,
+      message,
+      channel: "avatar",
+    }),
+  });
+  const fillerTextPromise = generateContextualFiller(openai, message);
+  const staticFillerId = pickFiller(message);
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      // Filler MUST be the first event on the wire so the client can fetch
-      // and queue the mp3 while the tool loop runs.
-      controller.enqueue(
-        ndjson({
-          type: "filler",
-          id: fillerId,
-          url: `/audio/fillers/${fillerId}.mp3`,
-        }),
-      );
+      let chunkIndex = 0;
 
-      const reader = upstreamBody.getReader();
+      // ── Filler task ── render contextual filler audio in Kai's voice, emit
+      // before any kai-agent audio. Falls back to static mp3 if either the
+      // text generation or the TTS fails.
+      const fillerTask = (async () => {
+        const fillerText = await fillerTextPromise;
+        if (fillerText) {
+          try {
+            const tts = await openai.audio.speech.create({
+              model: "gpt-4o-mini-tts",
+              voice: "onyx",
+              input: fillerText,
+              instructions: VOICE_INSTRUCTIONS,
+              response_format: "mp3",
+            });
+            const base64 = Buffer.from(await tts.arrayBuffer()).toString(
+              "base64",
+            );
+            controller.enqueue(
+              ndjson({
+                type: "audio_chunk",
+                index: chunkIndex++,
+                base64,
+                mime: "audio/mpeg",
+                text: fillerText,
+              }),
+            );
+            return;
+          } catch {
+            // fall through to static
+          }
+        }
+        // Fallback: static pre-rendered mp3 in /public/audio/fillers/
+        controller.enqueue(
+          ndjson({
+            type: "filler",
+            id: staticFillerId,
+            url: `/audio/fillers/${staticFillerId}.mp3`,
+          }),
+        );
+      })();
+
+      // ── Upstream task ── await the SSE response, then pump events.
+      let upstream: Response;
+      try {
+        upstream = await upstreamPromise;
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : "unknown";
+        controller.enqueue(
+          ndjson({ type: "error", message: `kai-agent unreachable: ${detail}` }),
+        );
+        await fillerTask;
+        controller.close();
+        return;
+      }
+      if (!upstream.ok || !upstream.body) {
+        const detail = await upstream.text().catch(() => "");
+        controller.enqueue(
+          ndjson({
+            type: "error",
+            message: `kai-agent ${upstream.status}: ${detail.slice(0, 200)}`,
+          }),
+        );
+        await fillerTask;
+        controller.close();
+        return;
+      }
+
+      const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
       const toolNames: string[] = [];
@@ -460,11 +547,14 @@ async function streamData(
         }),
       );
 
+      // Make sure the contextual filler audio_chunk is on the wire before any
+      // of kai-agent's sentences — preserves playback order on the client.
+      await fillerTask;
+
       // Render TTS per sentence. Sequential — keeps order, avoids overlap, and
       // gives the client something to play while later sentences are still
-      // rendering on the server.
+      // rendering on the server. chunkIndex continues from where filler left off.
       const sentences = splitSentences(replyText);
-      let chunkIndex = 0;
       for (const sentence of sentences) {
         try {
           const tts = await openai.audio.speech.create({
@@ -478,13 +568,12 @@ async function streamData(
           controller.enqueue(
             ndjson({
               type: "audio_chunk",
-              index: chunkIndex,
+              index: chunkIndex++,
               base64,
               mime: "audio/mpeg",
               text: sentence,
             }),
           );
-          chunkIndex += 1;
         } catch (e) {
           const detail = e instanceof Error ? e.message : "unknown";
           controller.enqueue(
@@ -496,9 +585,7 @@ async function streamData(
         }
       }
 
-      controller.enqueue(
-        ndjson({ type: "done", chunks: chunkIndex }),
-      );
+      controller.enqueue(ndjson({ type: "done", chunks: chunkIndex }));
       controller.close();
     },
   });
