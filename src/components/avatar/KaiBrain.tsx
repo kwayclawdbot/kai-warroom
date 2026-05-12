@@ -11,14 +11,13 @@ import * as THREE from "three";
 import { useAvatar } from "@/lib/avatar-store";
 import { REGIONS } from "@/lib/brain-regions";
 
-const NODE_COUNT = 800;
-const K_NEAREST = 5; // each node connects to 5 nearest = ~2000 unique edges
-const EDGE_SEGMENTS = 8; // points along each bezier curve → smooth, not angular
+const NODE_COUNT = 2000;
+const K_NEAREST = 4; // 2000 nodes × 4 nearest ≈ 4000 unique edges after dedupe
+const EDGE_SEGMENTS = 6; // points along each bezier curve — fewer is fine since curves are gentler
 const VERTS_PER_EDGE = EDGE_SEGMENTS * 2; // line segments need 2 verts each
-// Slightly elongated front-to-back, with a thin sagittal fissure splitting
-// the cloud into two hemispheres (see brainShapedPoint below).
-const ELLIPSOID = { x: 1.55, y: 1.35, z: 1.7 };
-const DRIFT_AMP = 0.06;
+// More compact + still slightly elongated front-back, with sagittal fissure.
+const ELLIPSOID = { x: 1.25, y: 1.1, z: 1.4 };
+const DRIFT_AMP = 0.045;
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -115,7 +114,7 @@ function buildEdges(positions: THREE.Vector3[]): [number, number][] {
   return edges;
 }
 
-/** Pre-compute curved (bezier) sample points + per-vertex region info. */
+/** Pre-compute curved (bezier) sample points + per-vertex region info + baseline gradient colors. */
 function buildCurvedEdgeGeometry(
   nodes: THREE.Vector3[],
   edges: [number, number][],
@@ -124,6 +123,9 @@ function buildCurvedEdgeGeometry(
   const edgeCount = edges.length;
   const positions = new Float32Array(edgeCount * VERTS_PER_EDGE * 3);
   const colors = new Float32Array(edgeCount * VERTS_PER_EDGE * 3);
+  // Precomputed full-saturation gradient colors per vertex. Per-frame we just
+  // scale these by the edge's current brightness — no lerp work in the hot path.
+  const baselineColors = new Float32Array(edgeCount * VERTS_PER_EDGE * 3);
   // For each vertex: (edgeIdx, endpointA, endpointB, t-along-curve)
   const edgeInfo = new Uint16Array(edgeCount * VERTS_PER_EDGE * 3);
   const tValues = new Float32Array(edgeCount * VERTS_PER_EDGE);
@@ -147,7 +149,8 @@ function buildCurvedEdgeGeometry(
     const rotAngle = Math.random() * Math.PI * 2;
     bendAxis.applyAxisAngle(dir, rotAngle);
     const edgeLen = A.distanceTo(B);
-    const bendMag = edgeLen * (0.14 + Math.random() * 0.16);
+    // Gentler curves — closer to straight, just enough bend to avoid angular look.
+    const bendMag = edgeLen * (0.04 + Math.random() * 0.07);
     const mid = new THREE.Vector3()
       .addVectors(A, B)
       .multiplyScalar(0.5)
@@ -155,6 +158,9 @@ function buildCurvedEdgeGeometry(
 
     const curve = new THREE.QuadraticBezierCurve3(A, mid, B);
     const samples = curve.getPoints(EDGE_SEGMENTS);
+
+    const colA = REGIONS[regions[a]].color;
+    const colB = REGIONS[regions[b]].color;
 
     // Emit line segments: (samples[0..1], samples[1..2], ...)
     for (let s = 0; s < EDGE_SEGMENTS; s++) {
@@ -164,14 +170,21 @@ function buildCurvedEdgeGeometry(
         positions[vIdx * 3] = sample.x;
         positions[vIdx * 3 + 1] = sample.y;
         positions[vIdx * 3 + 2] = sample.z;
-        tValues[vIdx] = (s + end) / EDGE_SEGMENTS;
+        const tt = (s + end) / EDGE_SEGMENTS;
+        tValues[vIdx] = tt;
         edgeInfo[vIdx * 3] = e;
         edgeInfo[vIdx * 3 + 1] = regions[a];
         edgeInfo[vIdx * 3 + 2] = regions[b];
+
+        // Precompute the full-saturation gradient at this point along the
+        // curve. Per-frame we only multiply by a brightness scalar.
+        baselineColors[vIdx * 3] = colA.r + (colB.r - colA.r) * tt;
+        baselineColors[vIdx * 3 + 1] = colA.g + (colB.g - colA.g) * tt;
+        baselineColors[vIdx * 3 + 2] = colA.b + (colB.b - colA.b) * tt;
       }
     }
   }
-  return { positions, colors, edgeInfo, tValues, edgeCount };
+  return { positions, colors, baselineColors, edgeInfo, tValues, edgeCount };
 }
 
 // ---- Glowing-orb shader for nodes ------------------------------------------
@@ -320,8 +333,11 @@ function NeuralGraph() {
     nodes.geometry.attributes.color.needsUpdate = true;
     nodes.geometry.attributes.aSize.needsUpdate = true;
 
-    // 2) Edge colors — gradient between endpoint region colors, brightness =
-    //    avg activation. Cascade fires add white-hot brightness.
+    // 2) Edge colors — scale precomputed baseline gradient by per-edge
+    //    brightness (cheap multiplies, no lerps). Brightness from avg
+    //    activation; same-region edges get a slight boost so the regions
+    //    read as zones.
+    const baselineColors = graph.edgeGeo.baselineColors;
     for (let e = 0; e < graph.edgeGeo.edgeCount; e++) {
       const ia = graph.edges[e][0];
       const ib = graph.edges[e][1];
@@ -330,23 +346,14 @@ function NeuralGraph() {
       const actA = regionActSmooth.current[ra];
       const actB = regionActSmooth.current[rb];
       const avgAct = (actA + actB) * 0.5;
-      const sameRegion = ra === rb ? 1 : 0;
-      // Inter-region edges stay dimmer so the regions read as zones.
+      const sameRegion = ra === rb;
+      // Thinner / wispier baseline — was 0.08, now 0.04. Active boost reduced.
       const baseBrightness =
-        0.08 + avgAct * (sameRegion ? 0.55 : 0.32) + sameRegion * 0.04;
+        0.04 + avgAct * (sameRegion ? 0.38 : 0.2) + (sameRegion ? 0.025 : 0);
 
-      const colA = REGIONS[ra].color;
-      const colB = REGIONS[rb].color;
-
-      for (let v = 0; v < VERTS_PER_EDGE; v++) {
-        const vIdx = e * VERTS_PER_EDGE + v;
-        const tt = graph.edgeGeo.tValues[vIdx];
-        const r = colA.r + (colB.r - colA.r) * tt;
-        const g = colA.g + (colB.g - colA.g) * tt;
-        const b = colA.b + (colB.b - colA.b) * tt;
-        edgeColors[vIdx * 3] = r * baseBrightness;
-        edgeColors[vIdx * 3 + 1] = g * baseBrightness;
-        edgeColors[vIdx * 3 + 2] = b * baseBrightness;
+      const base = e * VERTS_PER_EDGE * 3;
+      for (let i = 0; i < VERTS_PER_EDGE * 3; i++) {
+        edgeColors[base + i] = baselineColors[base + i] * baseBrightness;
       }
     }
 
@@ -425,7 +432,7 @@ function NeuralGraph() {
         <lineBasicMaterial
           vertexColors
           transparent
-          opacity={0.9}
+          opacity={0.55}
           blending={THREE.AdditiveBlending}
           depthWrite={false}
           toneMapped={false}
@@ -477,7 +484,7 @@ export function KaiBrain() {
         }}
       />
       <Canvas
-        camera={{ position: [0, 0, 5.6], fov: 50 }}
+        camera={{ position: [0, 0, 4.6], fov: 50 }}
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true }}
         style={{ background: "transparent" }}
@@ -487,8 +494,8 @@ export function KaiBrain() {
           enableDamping
           dampingFactor={0.06}
           enablePan={false}
-          minDistance={3.5}
-          maxDistance={11}
+          minDistance={3.0}
+          maxDistance={9}
           rotateSpeed={0.5}
           zoomSpeed={0.6}
         />
