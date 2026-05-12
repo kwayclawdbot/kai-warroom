@@ -1,405 +1,399 @@
 "use client";
 
-// Port of wink-at-web/src/components/BrainVisualization.tsx with a region-
-// awareness layer added. Same Jarvis aesthetic: sparse nodes, acid green +
-// ember orange only, wispy connections, dramatic infrequent synapse cascades.
-//
-// Each node is tagged with a region (0..7) by spatial zone — when a region
-// activates via useAvatar.pulseRegion(id), its nodes shift toward ember
-// orange and become preferred origins for cascade fires.
+// Obsidian-vault-graph-style neural mesh. ~300 nodes, ~1200 curved edges,
+// region-tagged colors, constant swirl + per-node drift, drag-to-orbit /
+// scroll-to-zoom controls in the spirit of kai-face.vercel.app.
 
+import { OrbitControls } from "@react-three/drei";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { useMemo, useRef } from "react";
 import * as THREE from "three";
 import { useAvatar } from "@/lib/avatar-store";
 import { REGIONS } from "@/lib/brain-regions";
 
-const NODE_COUNT = 100;
-const DUST_COUNT = 240;
-const REGION_COUNT = 8;
+const NODE_COUNT = 320;
+const K_NEAREST = 5; // each node connects to 5 nearest = ~1200 unique edges
+const EDGE_SEGMENTS = 9; // points along each bezier curve → smooth, not angular
+const VERTS_PER_EDGE = EDGE_SEGMENTS * 2; // line segments need 2 verts each
+const ELLIPSOID = { x: 1.65, y: 1.35, z: 1.15 };
+const DRIFT_AMP = 0.075;
 
-// ----- Color palette (wink-at-web brand) -----
-const ACID = { r: 0.55, g: 1.0, b: 0.12 }; // HSL 72° 100% 50% → acid green
-const EMBER = { r: 1.0, g: 0.45, b: 0.08 }; // HSL 30° 100% 50% → ember orange
+// ---- Helpers ----------------------------------------------------------------
 
-function NeuralCloud() {
+function ellipsoidPoint(): [number, number, number] {
+  // Uniform-ish point inside a unit ball, then map to ellipsoid.
+  let x = 0,
+    y = 0,
+    z = 0,
+    d = 2;
+  while (d > 1) {
+    x = Math.random() * 2 - 1;
+    y = Math.random() * 2 - 1;
+    z = Math.random() * 2 - 1;
+    d = x * x + y * y + z * z;
+  }
+  // Bias outward a bit so the cloud has visible "skin".
+  const r = Math.cbrt(d) * (0.55 + Math.random() * 0.45);
+  const inv = r / Math.max(Math.sqrt(d), 1e-6);
+  return [x * inv * ELLIPSOID.x, y * inv * ELLIPSOID.y, z * inv * ELLIPSOID.z];
+}
+
+function generateNodes() {
+  const positions: THREE.Vector3[] = [];
+  const regions = new Uint8Array(NODE_COUNT);
+  const seeds = new Float32Array(NODE_COUNT);
+
+  const regionDirs = REGIONS.map((r) =>
+    new THREE.Vector3(...r.position).normalize(),
+  );
+
+  for (let i = 0; i < NODE_COUNT; i++) {
+    const [x, y, z] = ellipsoidPoint();
+    positions.push(new THREE.Vector3(x, y, z));
+    seeds[i] = Math.random() * 1000;
+
+    // Region = closest region anchor by direction.
+    const dir = positions[i].clone().normalize();
+    let bestI = 0;
+    let bestDot = -Infinity;
+    for (let k = 0; k < regionDirs.length; k++) {
+      const d = dir.dot(regionDirs[k]);
+      if (d > bestDot) {
+        bestDot = d;
+        bestI = k;
+      }
+    }
+    regions[i] = bestI;
+  }
+  return { positions, regions, seeds };
+}
+
+/** Build k-nearest-neighbor edges, deduplicated. */
+function buildEdges(positions: THREE.Vector3[]): [number, number][] {
+  const edges: [number, number][] = [];
+  const seen = new Set<string>();
+  const distances: { idx: number; d: number }[] = [];
+
+  for (let i = 0; i < NODE_COUNT; i++) {
+    distances.length = 0;
+    for (let j = 0; j < NODE_COUNT; j++) {
+      if (i === j) continue;
+      distances.push({ idx: j, d: positions[i].distanceToSquared(positions[j]) });
+    }
+    distances.sort((a, b) => a.d - b.d);
+    for (let k = 0; k < K_NEAREST; k++) {
+      const j = distances[k].idx;
+      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        edges.push([i, j]);
+      }
+    }
+  }
+  return edges;
+}
+
+/** Pre-compute curved (bezier) sample points + per-vertex region info. */
+function buildCurvedEdgeGeometry(
+  nodes: THREE.Vector3[],
+  edges: [number, number][],
+  regions: Uint8Array,
+) {
+  const edgeCount = edges.length;
+  const positions = new Float32Array(edgeCount * VERTS_PER_EDGE * 3);
+  const colors = new Float32Array(edgeCount * VERTS_PER_EDGE * 3);
+  // For each vertex: (edgeIdx, endpointA, endpointB, t-along-curve)
+  const edgeInfo = new Uint16Array(edgeCount * VERTS_PER_EDGE * 3);
+  const tValues = new Float32Array(edgeCount * VERTS_PER_EDGE);
+
+  const up = new THREE.Vector3(0, 1, 0);
+  const tmp = new THREE.Vector3();
+
+  for (let e = 0; e < edgeCount; e++) {
+    const [a, b] = edges[e];
+    const A = nodes[a];
+    const B = nodes[b];
+
+    // Bend midpoint perpendicular to A→B, with small random magnitude.
+    const dir = tmp.copy(B).sub(A).normalize();
+    let bendAxis = new THREE.Vector3().crossVectors(dir, up);
+    if (bendAxis.lengthSq() < 1e-4) {
+      bendAxis = new THREE.Vector3(1, 0, 0);
+    }
+    bendAxis.normalize();
+    // Random rotation around the dir so the bend doesn't always lift "up".
+    const rotAngle = Math.random() * Math.PI * 2;
+    bendAxis.applyAxisAngle(dir, rotAngle);
+    const edgeLen = A.distanceTo(B);
+    const bendMag = edgeLen * (0.14 + Math.random() * 0.16);
+    const mid = new THREE.Vector3()
+      .addVectors(A, B)
+      .multiplyScalar(0.5)
+      .add(bendAxis.multiplyScalar(bendMag));
+
+    const curve = new THREE.QuadraticBezierCurve3(A, mid, B);
+    const samples = curve.getPoints(EDGE_SEGMENTS);
+
+    // Emit line segments: (samples[0..1], samples[1..2], ...)
+    for (let s = 0; s < EDGE_SEGMENTS; s++) {
+      for (let end = 0; end < 2; end++) {
+        const sample = samples[s + end];
+        const vIdx = e * VERTS_PER_EDGE + s * 2 + end;
+        positions[vIdx * 3] = sample.x;
+        positions[vIdx * 3 + 1] = sample.y;
+        positions[vIdx * 3 + 2] = sample.z;
+        tValues[vIdx] = (s + end) / EDGE_SEGMENTS;
+        edgeInfo[vIdx * 3] = e;
+        edgeInfo[vIdx * 3 + 1] = regions[a];
+        edgeInfo[vIdx * 3 + 2] = regions[b];
+      }
+    }
+  }
+  return { positions, colors, edgeInfo, tValues, edgeCount };
+}
+
+// ---- The cloud --------------------------------------------------------------
+
+function NeuralGraph() {
   const groupRef = useRef<THREE.Group>(null);
-  const linesRef = useRef<THREE.LineSegments>(null);
-  const pointsRef = useRef<THREE.Points>(null);
-  const glowPointsRef = useRef<THREE.Points>(null);
+  const nodesRef = useRef<THREE.Points>(null);
+  const edgesRef = useRef<THREE.LineSegments>(null);
 
-  const {
-    nodes,
-    edges,
-    nodeRegions,
-    basePositions,
-    linePositions,
-    glowPositions,
-  } = useMemo(() => {
-    const nodes: THREE.Vector3[] = [];
-    const nodeRegions = new Uint8Array(NODE_COUNT);
-
-    // Soft cloud shape — loosely spherical with organic variance.
-    for (let i = 0; i < NODE_COUNT; i++) {
-      const phi = Math.acos(2 * Math.random() - 1);
-      const theta = Math.random() * Math.PI * 2;
-      const r = 1.6 + Math.random() * 2.1;
-      const x = r * Math.sin(phi) * Math.cos(theta) * 1.4;
-      const y = r * Math.sin(phi) * Math.sin(theta) * 1.0;
-      const z = r * Math.cos(phi) * 1.1;
-      nodes.push(new THREE.Vector3(x, y, z));
-    }
-
-    // Assign each node to the nearest REGION by angular direction. This
-    // partitions the cloud into 8 contiguous lobes without changing shape.
-    const regionDirs = REGIONS.map((r) => {
-      const p = new THREE.Vector3(...r.position);
-      return p.normalize();
-    });
-    for (let i = 0; i < NODE_COUNT; i++) {
-      const dir = nodes[i].clone().normalize();
-      let bestI = 0;
-      let bestDot = -Infinity;
-      for (let k = 0; k < regionDirs.length; k++) {
-        const d = dir.dot(regionDirs[k]);
-        if (d > bestDot) {
-          bestDot = d;
-          bestI = k;
-        }
-      }
-      nodeRegions[i] = bestI;
-    }
-
-    // Longer-range connections for wispy look (same threshold as wink-at-web).
-    const edges: [number, number][] = [];
-    for (let i = 0; i < NODE_COUNT; i++) {
-      for (let j = i + 1; j < NODE_COUNT; j++) {
-        const dist = nodes[i].distanceTo(nodes[j]);
-        if (dist < 2.9 && Math.random() < 0.28) {
-          edges.push([i, j]);
-        }
-      }
-    }
-
+  // Build the graph ONCE.
+  const graph = useMemo(() => {
+    const { positions, regions, seeds } = generateNodes();
+    const edges = buildEdges(positions);
+    const edgeGeo = buildCurvedEdgeGeometry(positions, edges, regions);
     const basePositions = new Float32Array(NODE_COUNT * 3);
-    nodes.forEach((n, i) => {
-      basePositions[i * 3] = n.x;
-      basePositions[i * 3 + 1] = n.y;
-      basePositions[i * 3 + 2] = n.z;
+    positions.forEach((p, i) => {
+      basePositions[i * 3] = p.x;
+      basePositions[i * 3 + 1] = p.y;
+      basePositions[i * 3 + 2] = p.z;
     });
-
-    const linePositions = new Float32Array(edges.length * 6);
-    edges.forEach(([a, b], i) => {
-      linePositions[i * 6] = nodes[a].x;
-      linePositions[i * 6 + 1] = nodes[a].y;
-      linePositions[i * 6 + 2] = nodes[a].z;
-      linePositions[i * 6 + 3] = nodes[b].x;
-      linePositions[i * 6 + 4] = nodes[b].y;
-      linePositions[i * 6 + 5] = nodes[b].z;
-    });
-
-    // Ambient ember/acid dust.
-    const glowPositions = new Float32Array(DUST_COUNT * 3);
-    for (let i = 0; i < DUST_COUNT; i++) {
-      const phi = Math.acos(2 * Math.random() - 1);
-      const theta = Math.random() * Math.PI * 2;
-      const r = 0.5 + Math.random() * 3.7;
-      glowPositions[i * 3] = r * Math.sin(phi) * Math.cos(theta) * 1.5;
-      glowPositions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta) * 1.1;
-      glowPositions[i * 3 + 2] = r * Math.cos(phi) * 1.2;
-    }
-
     return {
-      nodes,
+      positions,
+      regions,
+      seeds,
       edges,
-      nodeRegions,
+      edgeGeo,
       basePositions,
-      linePositions,
-      glowPositions,
     };
   }, []);
 
-  const positions = useMemo(
-    () => new Float32Array(basePositions),
-    [basePositions],
+  // Mutable per-frame buffers.
+  const nodePositions = useMemo(
+    () => new Float32Array(graph.basePositions),
+    [graph.basePositions],
   );
-  const lineColors = useMemo(
-    () => new Float32Array(edges.length * 6),
-    [edges],
-  );
-  const pointColors = useMemo(
-    () => new Float32Array(NODE_COUNT * 3),
-    [],
-  );
-  const pointSizes = useMemo(() => new Float32Array(NODE_COUNT), []);
-  const glowColors = useMemo(() => new Float32Array(DUST_COUNT * 3), []);
+  const nodeColors = useMemo(() => new Float32Array(NODE_COUNT * 3), []);
+  const edgeColors = graph.edgeGeo.colors;
 
-  // Internal smoothed region activations (0..1) for stable color transitions.
-  const regionActSmooth = useRef(new Float32Array(REGION_COUNT));
-  // Synapse firing queue.
-  const firingRef = useRef<
-    { edgeIdx: number; startTime: number; intensity: number; ember: boolean }[]
+  // Smoothed region activations.
+  const regionActSmooth = useRef(new Float32Array(8));
+  const cascadesRef = useRef<
+    { edgeIdx: number; startTime: number; intensity: number }[]
   >([]);
 
-  // Pre-compute which edges belong to which region (an edge "belongs" to
-  // region X if its midpoint's nearest region is X — used to bias cascades).
-  const edgeRegion = useMemo(() => {
-    const out = new Uint8Array(edges.length);
-    for (let i = 0; i < edges.length; i++) {
-      out[i] = nodeRegions[edges[i][0]];
-    }
-    return out;
-  }, [edges, nodeRegions]);
+  // Map node → list of edge indices for cascade chaining.
+  const nodeEdges = useMemo(() => {
+    const m: number[][] = Array.from({ length: NODE_COUNT }, () => []);
+    graph.edges.forEach(([a, b], i) => {
+      m[a].push(i);
+      m[b].push(i);
+    });
+    return m;
+  }, [graph.edges]);
 
-  useFrame(({ clock }, delta) => {
-    const t = clock.elapsedTime;
-    const state = useAvatar.getState();
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime;
+    const grp = groupRef.current;
+    const nodes = nodesRef.current;
+    const edges = edgesRef.current;
+    if (!grp || !nodes || !edges) return;
 
-    // 1) Smooth region activation values from store.
+    // Constant swirl — runs regardless of audio/region state.
+    grp.rotation.y = t * 0.05;
+    grp.rotation.x = Math.sin(t * 0.035) * 0.12;
+
+    // Smooth region activations from store.
+    const state2 = useAvatar.getState();
     const k = Math.min(1, delta * 5);
-    for (let r = 0; r < REGION_COUNT; r++) {
-      const id = REGIONS[r].id;
-      const target = state.regions[id] ?? 0;
-      regionActSmooth.current[r] += (target - regionActSmooth.current[r]) * k;
-    }
-
-    if (groupRef.current) {
-      // Slow, dreamy rotation + gentle breathing (bass-modulated).
-      groupRef.current.rotation.y = t * 0.06;
-      groupRef.current.rotation.x = Math.sin(t * 0.04) * 0.08;
-      const breathe = 1.0 + Math.sin(t * 0.3) * 0.02 + state.bass * 0.04;
-      groupRef.current.scale.setScalar(breathe);
-    }
-
-    // 2) Drift nodes organically.
-    if (pointsRef.current) {
-      const geo = pointsRef.current.geometry;
-      const pos = geo.attributes.position.array as Float32Array;
-      for (let i = 0; i < NODE_COUNT; i++) {
-        const seed = i * 0.7;
-        pos[i * 3] = basePositions[i * 3] + Math.sin(t * 0.2 + seed) * 0.15;
-        pos[i * 3 + 1] =
-          basePositions[i * 3 + 1] + Math.cos(t * 0.15 + seed * 1.3) * 0.15;
-        pos[i * 3 + 2] =
-          basePositions[i * 3 + 2] + Math.sin(t * 0.25 + seed * 0.9) * 0.1;
-      }
-      geo.attributes.position.needsUpdate = true;
-
-      // Mirror to line endpoints.
-      if (linesRef.current) {
-        const lineGeo = linesRef.current.geometry;
-        const linePos = lineGeo.attributes.position.array as Float32Array;
-        for (let i = 0; i < edges.length; i++) {
-          const [a, b] = edges[i];
-          linePos[i * 6] = pos[a * 3];
-          linePos[i * 6 + 1] = pos[a * 3 + 1];
-          linePos[i * 6 + 2] = pos[a * 3 + 2];
-          linePos[i * 6 + 3] = pos[b * 3];
-          linePos[i * 6 + 4] = pos[b * 3 + 1];
-          linePos[i * 6 + 5] = pos[b * 3 + 2];
-        }
-        lineGeo.attributes.position.needsUpdate = true;
-      }
-
-      // 3) Node colors — interpolate between acid (idle) and ember (active).
-      for (let i = 0; i < NODE_COUNT; i++) {
-        const region = nodeRegions[i];
-        const act = regionActSmooth.current[region]; // 0..1
-        const pulse = Math.sin(t * 1.2 + i * 1.1) * 0.5 + 0.5;
-
-        // Mix acid → ember by activation, then add per-node sparkle pulse.
-        const mix = Math.min(1, act);
-        const baseR = ACID.r + (EMBER.r - ACID.r) * mix;
-        const baseG = ACID.g + (EMBER.g - ACID.g) * mix;
-        const baseB = ACID.b + (EMBER.b - ACID.b) * mix;
-
-        // Brightness scales with activation + per-node pulse.
-        const brightness = 0.55 + pulse * 0.35 + act * 0.4;
-        pointColors[i * 3] = baseR * brightness;
-        pointColors[i * 3 + 1] = baseG * brightness;
-        pointColors[i * 3 + 2] = baseB * brightness;
-
-        // Sizes: bigger when active, slightly bigger on pulse.
-        pointSizes[i] = 0.12 + pulse * 0.05 + act * 0.18;
-      }
-      geo.setAttribute(
-        "color",
-        new THREE.BufferAttribute(pointColors, 3),
-      );
-      geo.attributes.color.needsUpdate = true;
-    }
-
-    // 4) Spawn synapse cascades. Probability ramps with the max active region
-    // value — when the brain is "thinking hard" you see more firings.
     let maxAct = 0;
     let hotRegion = -1;
-    for (let r = 0; r < REGION_COUNT; r++) {
+    for (let r = 0; r < 8; r++) {
+      const target = state2.regions[REGIONS[r].id] ?? 0;
+      regionActSmooth.current[r] +=
+        (target - regionActSmooth.current[r]) * k;
       if (regionActSmooth.current[r] > maxAct) {
         maxAct = regionActSmooth.current[r];
         hotRegion = r;
       }
     }
-    const baseRate = 0.04;
-    const hotRate = baseRate + maxAct * 0.16;
 
-    if (Math.random() < hotRate) {
-      // Cascade origin: bias toward edges in the hot region.
-      let startEdge = Math.floor(Math.random() * edges.length);
-      if (hotRegion >= 0 && Math.random() < 0.7) {
-        const regionEdges: number[] = [];
-        for (let i = 0; i < edges.length; i++) {
-          if (edgeRegion[i] === hotRegion) regionEdges.push(i);
-        }
-        if (regionEdges.length > 0) {
-          startEdge =
-            regionEdges[Math.floor(Math.random() * regionEdges.length)];
-        }
-      }
-      const cascadeCount = 2 + Math.floor(Math.random() * 4);
-      const startNode = edges[startEdge][1];
-      const cascadeIsEmber = hotRegion >= 0 && Math.random() < 0.6;
+    // 1) Node drift + color.
+    for (let i = 0; i < NODE_COUNT; i++) {
+      const seed = graph.seeds[i];
+      const region = graph.regions[i];
+      const act = regionActSmooth.current[region];
+      const pulse = Math.sin(t * 1.1 + seed * 0.7) * 0.5 + 0.5;
 
-      for (let c = 0; c < cascadeCount; c++) {
-        const connected = edges
-          .map((e, idx) => ({ e, idx }))
-          .filter(({ e }) => e[0] === startNode || e[1] === startNode);
-        if (connected.length > 0) {
-          const pick = connected[Math.floor(Math.random() * connected.length)];
-          firingRef.current.push({
-            edgeIdx: pick.idx,
-            startTime: t + c * 0.08,
-            intensity: 1.0 - c * 0.1,
-            ember: cascadeIsEmber,
-          });
-        }
+      // Independent drift — each node moves on its own sine path.
+      nodePositions[i * 3] =
+        graph.basePositions[i * 3] +
+        Math.sin(t * 0.25 + seed) * DRIFT_AMP;
+      nodePositions[i * 3 + 1] =
+        graph.basePositions[i * 3 + 1] +
+        Math.cos(t * 0.21 + seed * 1.3) * DRIFT_AMP;
+      nodePositions[i * 3 + 2] =
+        graph.basePositions[i * 3 + 2] +
+        Math.sin(t * 0.19 + seed * 0.7) * DRIFT_AMP * 0.7;
+
+      // Region-colored node: dim baseline, brighter + slightly hotter on activation.
+      const rc = REGIONS[region].color;
+      const baseBrightness = 0.45 + pulse * 0.18 + act * 0.55;
+      // Add a touch of white at activation peak for hot-center feel.
+      const whiteMix = act * 0.18 * pulse;
+      nodeColors[i * 3] = Math.min(1, rc.r * baseBrightness + whiteMix);
+      nodeColors[i * 3 + 1] = Math.min(1, rc.g * baseBrightness + whiteMix);
+      nodeColors[i * 3 + 2] = Math.min(1, rc.b * baseBrightness + whiteMix);
+    }
+    nodes.geometry.attributes.position.needsUpdate = true;
+    nodes.geometry.attributes.color.needsUpdate = true;
+
+    // 2) Edge colors — gradient between endpoint region colors, brightness =
+    //    avg activation. Cascade fires add white-hot brightness.
+    for (let e = 0; e < graph.edgeGeo.edgeCount; e++) {
+      const ia = graph.edges[e][0];
+      const ib = graph.edges[e][1];
+      const ra = graph.regions[ia];
+      const rb = graph.regions[ib];
+      const actA = regionActSmooth.current[ra];
+      const actB = regionActSmooth.current[rb];
+      const avgAct = (actA + actB) * 0.5;
+      const sameRegion = ra === rb ? 1 : 0;
+      // Inter-region edges stay dimmer so the regions read as zones.
+      const baseBrightness =
+        0.08 + avgAct * (sameRegion ? 0.55 : 0.32) + sameRegion * 0.04;
+
+      const colA = REGIONS[ra].color;
+      const colB = REGIONS[rb].color;
+
+      for (let v = 0; v < VERTS_PER_EDGE; v++) {
+        const vIdx = e * VERTS_PER_EDGE + v;
+        const tt = graph.edgeGeo.tValues[vIdx];
+        const r = colA.r + (colB.r - colA.r) * tt;
+        const g = colA.g + (colB.g - colA.g) * tt;
+        const b = colA.b + (colB.b - colA.b) * tt;
+        edgeColors[vIdx * 3] = r * baseBrightness;
+        edgeColors[vIdx * 3 + 1] = g * baseBrightness;
+        edgeColors[vIdx * 3 + 2] = b * baseBrightness;
       }
     }
-    // Expire old firings.
-    firingRef.current = firingRef.current.filter(
-      (f) => t - f.startTime < 0.85,
+
+    // 3) Synapse cascades — probability ramps with max activation. Cascade
+    //    walks a short chain of connected edges with stagger and decay.
+    const fireRate = 0.05 + maxAct * 0.18;
+    if (Math.random() < fireRate) {
+      // Pick origin node: bias toward the hot region's nodes.
+      let originNode = Math.floor(Math.random() * NODE_COUNT);
+      if (hotRegion >= 0 && Math.random() < 0.75) {
+        const hotNodes: number[] = [];
+        for (let i = 0; i < NODE_COUNT; i++) {
+          if (graph.regions[i] === hotRegion) hotNodes.push(i);
+        }
+        if (hotNodes.length > 0) {
+          originNode = hotNodes[Math.floor(Math.random() * hotNodes.length)];
+        }
+      }
+      const chainLen = 3 + Math.floor(Math.random() * 4);
+      let currentNode = originNode;
+      for (let c = 0; c < chainLen; c++) {
+        const candidates = nodeEdges[currentNode];
+        if (candidates.length === 0) break;
+        const edgeIdx =
+          candidates[Math.floor(Math.random() * candidates.length)];
+        cascadesRef.current.push({
+          edgeIdx,
+          startTime: t + c * 0.07,
+          intensity: 1 - c * 0.12,
+        });
+        // Walk to the other end for next hop.
+        const [ea, eb] = graph.edges[edgeIdx];
+        currentNode = currentNode === ea ? eb : ea;
+      }
+    }
+    // Expire old.
+    cascadesRef.current = cascadesRef.current.filter(
+      (c) => t - c.startTime < 0.85,
     );
 
-    // 5) Line colors.
-    if (linesRef.current) {
-      const geo = linesRef.current.geometry;
-      for (let i = 0; i < edges.length; i++) {
-        const firing = firingRef.current.find(
-          (f) => f.edgeIdx === i && t >= f.startTime,
-        );
-        if (firing) {
-          const age = t - firing.startTime;
-          const fadeIn = Math.min(age / 0.05, 1);
-          const fadeOut = Math.max(0, 1 - (age - 0.1) / 0.7);
-          const brightness = fadeIn * fadeOut * firing.intensity;
-          // White-hot peak that decays into ember or acid.
-          const r = brightness * (firing.ember ? 1.0 : 0.85);
-          const g = brightness * (firing.ember ? 0.55 : 1.0);
-          const b = brightness * (firing.ember ? 0.1 : 0.35);
-          lineColors[i * 6] = r;
-          lineColors[i * 6 + 1] = g;
-          lineColors[i * 6 + 2] = b;
-          lineColors[i * 6 + 3] = r;
-          lineColors[i * 6 + 4] = g;
-          lineColors[i * 6 + 5] = b;
-        } else {
-          // Dim ambient connection — slightly hotter for active regions.
-          const region = edgeRegion[i];
-          const act = regionActSmooth.current[region];
-          const dim = 0.06 + Math.sin(t * 0.5 + i * 0.2) * 0.03 + act * 0.12;
-          // Shift toward ember in active regions.
-          const mix = Math.min(1, act);
-          lineColors[i * 6] = dim * (0.5 + mix * 0.5);
-          lineColors[i * 6 + 1] = dim * (1.0 - mix * 0.4);
-          lineColors[i * 6 + 2] = dim * (0.0 + mix * 0.1);
-          lineColors[i * 6 + 3] = lineColors[i * 6];
-          lineColors[i * 6 + 4] = lineColors[i * 6 + 1];
-          lineColors[i * 6 + 5] = lineColors[i * 6 + 2];
-        }
+    // 4) Overlay cascade white-hot brightness onto edges.
+    for (const c of cascadesRef.current) {
+      const age = t - c.startTime;
+      if (age < 0) continue;
+      const fadeIn = Math.min(age / 0.05, 1);
+      const fadeOut = Math.max(0, 1 - (age - 0.1) / 0.7);
+      const boost = fadeIn * fadeOut * c.intensity;
+      if (boost <= 0) continue;
+      const baseV = c.edgeIdx * VERTS_PER_EDGE;
+      for (let v = 0; v < VERTS_PER_EDGE; v++) {
+        const idx = (baseV + v) * 3;
+        edgeColors[idx] = Math.min(1, edgeColors[idx] + boost);
+        edgeColors[idx + 1] = Math.min(1, edgeColors[idx + 1] + boost);
+        edgeColors[idx + 2] = Math.min(1, edgeColors[idx + 2] + boost);
       }
-      geo.setAttribute(
-        "color",
-        new THREE.BufferAttribute(lineColors, 3),
-      );
-      geo.attributes.color.needsUpdate = true;
     }
-
-    // 6) Ambient glow particles.
-    if (glowPointsRef.current) {
-      const geo = glowPointsRef.current.geometry;
-      const pos = geo.attributes.position.array as Float32Array;
-      for (let i = 0; i < DUST_COUNT; i++) {
-        const seed = i * 0.4;
-        pos[i * 3] += Math.sin(t * 0.1 + seed) * 0.002;
-        pos[i * 3 + 1] += Math.cos(t * 0.08 + seed) * 0.002;
-        pos[i * 3 + 2] += Math.sin(t * 0.12 + seed * 0.7) * 0.001;
-
-        const pulse = Math.sin(t * 0.8 + i * 0.3) * 0.5 + 0.5;
-        if (i % 5 === 0) {
-          glowColors[i * 3] = 0.35 + pulse * 0.3;
-          glowColors[i * 3 + 1] = 0.16 + pulse * 0.15;
-          glowColors[i * 3 + 2] = 0;
-        } else {
-          glowColors[i * 3] = 0.18 + pulse * 0.22;
-          glowColors[i * 3 + 1] = 0.3 + pulse * 0.35;
-          glowColors[i * 3 + 2] = 0;
-        }
-      }
-      geo.attributes.position.needsUpdate = true;
-      geo.setAttribute(
-        "color",
-        new THREE.BufferAttribute(glowColors, 3),
-      );
-      geo.attributes.color.needsUpdate = true;
-    }
+    edges.geometry.attributes.color.needsUpdate = true;
   });
 
   return (
     <group ref={groupRef}>
-      {/* Ambient dust */}
-      <points ref={glowPointsRef}>
+      {/* Edges first so nodes draw on top. */}
+      <lineSegments ref={edgesRef}>
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            args={[glowPositions, 3]}
-            count={DUST_COUNT}
+            args={[graph.edgeGeo.positions, 3]}
+            count={graph.edgeGeo.edgeCount * VERTS_PER_EDGE}
+          />
+          <bufferAttribute
+            attach="attributes-color"
+            args={[edgeColors, 3]}
+            count={graph.edgeGeo.edgeCount * VERTS_PER_EDGE}
           />
         </bufferGeometry>
-        <pointsMaterial
+        <lineBasicMaterial
           vertexColors
-          size={0.04}
           transparent
-          opacity={0.45}
-          sizeAttenuation
+          opacity={0.9}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          toneMapped={false}
         />
-      </points>
-
-      {/* Synaptic connections */}
-      <lineSegments ref={linesRef}>
-        <bufferGeometry>
-          <bufferAttribute
-            attach="attributes-position"
-            args={[linePositions, 3]}
-            count={edges.length * 2}
-          />
-        </bufferGeometry>
-        <lineBasicMaterial vertexColors transparent opacity={0.7} />
       </lineSegments>
 
-      {/* Core nodes */}
-      <points ref={pointsRef}>
+      <points ref={nodesRef}>
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
-            args={[positions, 3]}
+            args={[nodePositions, 3]}
+            count={NODE_COUNT}
+          />
+          <bufferAttribute
+            attach="attributes-color"
+            args={[nodeColors, 3]}
             count={NODE_COUNT}
           />
         </bufferGeometry>
         <pointsMaterial
           vertexColors
-          size={0.16}
+          size={0.13}
           transparent
-          opacity={0.9}
+          opacity={0.95}
           sizeAttenuation
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          toneMapped={false}
         />
       </points>
     </group>
@@ -408,23 +402,32 @@ function NeuralCloud() {
 
 export function KaiBrain() {
   return (
-    <div className="absolute inset-0 pointer-events-none">
-      {/* Soft radial backdrop matching wink-at-web's hero glow. */}
+    <div className="absolute inset-0">
+      {/* Subtle radial backdrop — kai-face uses near-black, we keep that vibe. */}
       <div
-        className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[700px] h-[700px] md:w-[1100px] md:h-[1100px]"
+        className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] md:w-[1200px] md:h-[1200px]"
         style={{
           background:
-            "radial-gradient(circle, hsla(72, 100%, 50%, 0.14) 0%, hsla(30, 100%, 50%, 0.07) 40%, transparent 70%)",
-          filter: "blur(40px)",
+            "radial-gradient(circle, hsla(45, 90%, 55%, 0.08) 0%, hsla(280, 70%, 55%, 0.04) 45%, transparent 70%)",
+          filter: "blur(60px)",
         }}
       />
       <Canvas
-        camera={{ position: [0, 0, 7], fov: 50 }}
-        dpr={[1, 1.5]}
+        camera={{ position: [0, 0, 5.6], fov: 50 }}
+        dpr={[1, 2]}
         gl={{ antialias: true, alpha: true }}
         style={{ background: "transparent" }}
       >
-        <NeuralCloud />
+        <NeuralGraph />
+        <OrbitControls
+          enableDamping
+          dampingFactor={0.06}
+          enablePan={false}
+          minDistance={3.5}
+          maxDistance={11}
+          rotateSpeed={0.5}
+          zoomSpeed={0.6}
+        />
       </Canvas>
     </div>
   );
