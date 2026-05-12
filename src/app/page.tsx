@@ -325,7 +325,9 @@ export default function Home() {
           resolve(blob);
         };
       });
-      mr.start(120);
+      // No timeslice — Safari's MediaRecorder produces malformed mp4 chunks
+      // when start() is called with an interval. Deliver one valid blob on stop.
+      mr.start();
 
       recorderRef.current = {
         stop: () => {
@@ -365,7 +367,17 @@ export default function Home() {
     setTranscribing(true);
     try {
       const form = new FormData();
-      form.append("audio", blob, "mic.webm");
+      // Use the blob's actual MIME-derived extension so the server reads it
+      // as the correct format. Safari produces audio/mp4; Chrome audio/webm.
+      const ext = blob.type.includes("mp4")
+        ? "mp4"
+        : blob.type.includes("ogg")
+          ? "ogg"
+          : blob.type.includes("wav")
+            ? "wav"
+            : "webm";
+      form.append("audio", blob, `mic.${ext}`);
+      console.log("[mic] blob", blob.type, blob.size, "ext", ext);
       const res = await fetch("/api/transcribe", {
         method: "POST",
         body: form,

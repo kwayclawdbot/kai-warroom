@@ -83,7 +83,7 @@ class AudioEngine {
     this.currentBufferSource = src;
     this.startBandReader();
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       const onEnded = () => {
         this.cleanupBands();
         this.currentBufferSource = null;
@@ -92,7 +92,19 @@ class AudioEngine {
       };
       this.currentEndedHandler = onEnded;
       src.onended = onEnded;
-      src.start(0);
+      try {
+        src.start(0);
+        // Safety net: if onended never fires (silent autoplay block),
+        // resolve after the buffer's natural duration + 500ms.
+        window.setTimeout(
+          () => {
+            if (this.currentBufferSource === src) onEnded();
+          },
+          audioBuffer.duration * 1000 + 500,
+        );
+      } catch (e) {
+        reject(e);
+      }
     });
   }
 
