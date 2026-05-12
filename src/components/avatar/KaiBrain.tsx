@@ -303,54 +303,50 @@ function NeuralGraph() {
       }
     }
 
-    // 1) Node drift + color. Speech speeds up both flicker and drift so the
-    //    nodes appear to fire faster during talking — but the cloud as a
-    //    whole stays the same size.
-    const flickerRate = 4.8 + intensity * 5.5; // ~5 rad/s idle, ~10 rad/s loud
-    const driftSpeed = 1.0 + intensity * 1.2 + bass * 0.6;
+    // 1) Node drift + color. Nodes themselves do NOT individually flicker.
+    //    The cloud as a whole has a synced ambient breath; speech is expressed
+    //    via line glow + faster synapse cascades, not per-node twinkling.
+    const ambientPulse = Math.sin(t * 1.5) * 0.5 + 0.5; // synced across all nodes
+    const globalGlow = ambientPulse * 0.08 + intensity * 0.45 + bass * 0.2;
     for (let i = 0; i < NODE_COUNT; i++) {
       const seed = graph.seeds[i];
       const region = graph.regions[i];
       const act = regionActSmooth.current[region];
-      const pulse = Math.sin(t * flickerRate + seed * 0.7) * 0.5 + 0.5;
 
-      // Independent drift — each node moves on its own sine path. Drift speed
-      // ramps with speech so the cloud shimmers faster when talking.
+      // Independent drift — each node moves on its own sine path, slow.
       nodePositions[i * 3] =
         graph.basePositions[i * 3] +
-        Math.sin(t * 0.25 * driftSpeed + seed) * DRIFT_AMP;
+        Math.sin(t * 0.25 + seed) * DRIFT_AMP;
       nodePositions[i * 3 + 1] =
         graph.basePositions[i * 3 + 1] +
-        Math.cos(t * 0.21 * driftSpeed + seed * 1.3) * DRIFT_AMP;
+        Math.cos(t * 0.21 + seed * 1.3) * DRIFT_AMP;
       nodePositions[i * 3 + 2] =
         graph.basePositions[i * 3 + 2] +
-        Math.sin(t * 0.19 * driftSpeed + seed * 0.7) * DRIFT_AMP * 0.7;
+        Math.sin(t * 0.19 + seed * 0.7) * DRIFT_AMP * 0.7;
 
-      // Region-colored node: dim baseline, brighter + slightly hotter on
-      // activation, and a global glow boost driven by speech intensity so the
-      // whole cloud "lights up" on every syllable.
+      // Region-colored node — dim baseline, brighter on region activation,
+      // plus the synced globalGlow lifts ALL nodes together on each syllable.
       const rc = REGIONS[region].color;
-      const glowBoost = intensity * 0.4 + bass * 0.15;
-      const baseBrightness = 0.4 + pulse * 0.22 + act * 0.6 + glowBoost;
-      // Add a touch of white at activation peak + speech crest for hot-center.
-      const whiteMix = act * 0.18 * pulse + intensity * 0.18 * pulse;
-      nodeColors[i * 3] = Math.min(1, rc.r * baseBrightness + whiteMix);
-      nodeColors[i * 3 + 1] = Math.min(1, rc.g * baseBrightness + whiteMix);
-      nodeColors[i * 3 + 2] = Math.min(1, rc.b * baseBrightness + whiteMix);
+      const brightness = 0.42 + act * 0.6 + globalGlow * 0.55;
+      // White-hot center mix only on region activation peaks (not speech).
+      const whiteMix = act * 0.22;
+      nodeColors[i * 3] = Math.min(1, rc.r * brightness + whiteMix);
+      nodeColors[i * 3 + 1] = Math.min(1, rc.g * brightness + whiteMix);
+      nodeColors[i * 3 + 2] = Math.min(1, rc.b * brightness + whiteMix);
 
-      // Size grows with activation + small flicker — keep speech boost subtle
-      // so node sizes don't visibly swell across the whole cloud.
-      nodeSizes[i] = 0.05 + pulse * 0.022 + act * 0.13 + intensity * 0.012;
+      // Size only reacts to region activation. No global speech swell.
+      nodeSizes[i] = 0.06 + act * 0.13;
     }
     nodes.geometry.attributes.position.needsUpdate = true;
     nodes.geometry.attributes.color.needsUpdate = true;
     nodes.geometry.attributes.aSize.needsUpdate = true;
 
     // 2) Edge colors — scale precomputed baseline gradient by per-edge
-    //    brightness (cheap multiplies, no lerps). Brightness from avg
-    //    activation; same-region edges get a slight boost so the regions
-    //    read as zones.
+    //    brightness. This is where the "global glow pulse" lives: every
+    //    line brightens together with speech intensity, making the internal
+    //    neuron network look like it's lighting up on each syllable.
     const baselineColors = graph.edgeGeo.baselineColors;
+    const speechLineBoost = intensity * 0.55 + bass * 0.25;
     for (let e = 0; e < graph.edgeGeo.edgeCount; e++) {
       const ia = graph.edges[e][0];
       const ib = graph.edges[e][1];
@@ -360,9 +356,11 @@ function NeuralGraph() {
       const actB = regionActSmooth.current[rb];
       const avgAct = (actA + actB) * 0.5;
       const sameRegion = ra === rb;
-      // Thinner / wispier baseline — was 0.08, now 0.04. Active boost reduced.
       const baseBrightness =
-        0.04 + avgAct * (sameRegion ? 0.38 : 0.2) + (sameRegion ? 0.025 : 0);
+        0.04 +
+        avgAct * (sameRegion ? 0.38 : 0.2) +
+        (sameRegion ? 0.025 : 0) +
+        speechLineBoost;
 
       const base = e * VERTS_PER_EDGE * 3;
       for (let i = 0; i < VERTS_PER_EDGE * 3; i++) {
@@ -370,14 +368,16 @@ function NeuralGraph() {
       }
     }
 
-    // 3) Synapse cascades — probability ramps with max activation AND with
-    //    speech intensity (so the brain looks visibly more active when Kai
-    //    is talking). Cascade walks a short chain with stagger and decay.
-    const fireRate = 0.05 + maxAct * 0.18 + intensity * 0.18;
-    if (Math.random() < fireRate) {
-      // Pick origin node: bias toward the hot region's nodes.
+    // 3) Synapse cascades — probability ramps HARD with speech intensity so
+    //    the neuron network appears to fire much faster while talking.
+    //    Cascades also walk faster (shorter stagger) and clear faster.
+    const fireRate = 0.04 + maxAct * 0.2 + intensity * 0.55;
+    // Multiple cascades can spawn per frame at peak speech.
+    const cascadesThisFrame = Math.floor(fireRate) + (Math.random() < fireRate - Math.floor(fireRate) ? 1 : 0);
+    for (let n = 0; n < cascadesThisFrame; n++) {
+      // Pick origin node: bias toward the hot region's nodes during region pulses.
       let originNode = Math.floor(Math.random() * NODE_COUNT);
-      if (hotRegion >= 0 && Math.random() < 0.75) {
+      if (hotRegion >= 0 && Math.random() < 0.7) {
         const hotNodes: number[] = [];
         for (let i = 0; i < NODE_COUNT; i++) {
           if (graph.regions[i] === hotRegion) hotNodes.push(i);
@@ -386,7 +386,9 @@ function NeuralGraph() {
           originNode = hotNodes[Math.floor(Math.random() * hotNodes.length)];
         }
       }
-      const chainLen = 3 + Math.floor(Math.random() * 4);
+      const chainLen = 2 + Math.floor(Math.random() * 4);
+      // Shorter stagger when speaking — chain fires faster.
+      const stagger = 0.04 - intensity * 0.02;
       let currentNode = originNode;
       for (let c = 0; c < chainLen; c++) {
         const candidates = nodeEdges[currentNode];
@@ -395,25 +397,28 @@ function NeuralGraph() {
           candidates[Math.floor(Math.random() * candidates.length)];
         cascadesRef.current.push({
           edgeIdx,
-          startTime: t + c * 0.07,
+          startTime: t + c * stagger,
           intensity: 1 - c * 0.12,
         });
-        // Walk to the other end for next hop.
         const [ea, eb] = graph.edges[edgeIdx];
         currentNode = currentNode === ea ? eb : ea;
       }
     }
-    // Expire old.
+    // Shorter cascade lifetime during speech — clear faster so the network
+    // appears to fire-and-reset rapidly.
+    const cascadeLife = 0.85 - intensity * 0.4;
     cascadesRef.current = cascadesRef.current.filter(
-      (c) => t - c.startTime < 0.85,
+      (c) => t - c.startTime < cascadeLife,
     );
 
-    // 4) Overlay cascade white-hot brightness onto edges.
+    // 4) Overlay cascade white-hot brightness onto edges. Fade timings shrink
+    //    with speech so each cascade reads as a sharper, faster flash.
+    const fadeOutDur = 0.55 - intensity * 0.25;
     for (const c of cascadesRef.current) {
       const age = t - c.startTime;
       if (age < 0) continue;
-      const fadeIn = Math.min(age / 0.05, 1);
-      const fadeOut = Math.max(0, 1 - (age - 0.1) / 0.7);
+      const fadeIn = Math.min(age / 0.04, 1);
+      const fadeOut = Math.max(0, 1 - (age - 0.08) / fadeOutDur);
       const boost = fadeIn * fadeOut * c.intensity;
       if (boost <= 0) continue;
       const baseV = c.edgeIdx * VERTS_PER_EDGE;
