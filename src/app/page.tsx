@@ -75,7 +75,7 @@ export default function Home() {
   const pulseRegion = useAvatar((s) => s.pulseRegion);
   const clearRegions = useAvatar((s) => s.clearRegions);
 
-  const [mode, setMode] = useState<DemoMode>("speaking");
+  const [mode, setMode] = useState<DemoMode>("off");
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatPlaying, setChatPlaying] = useState(false);
@@ -383,7 +383,25 @@ export default function Home() {
         setChatError("didn't catch that — try again");
         return;
       }
-      // Auto-send the transcript.
+      // Filter Whisper hallucinations on silence/noise.
+      const lower = text.toLowerCase().replace(/[.!?,]/g, "");
+      const HALLUCINATIONS = new Set([
+        "thanks for watching",
+        "thank you",
+        "thank you for watching",
+        "you",
+        "hi",
+        "hello",
+        "okay",
+        "ok",
+        "bye",
+      ]);
+      if (HALLUCINATIONS.has(lower) || lower.length < 3) {
+        setChatError(`heard "${text}" — didn't catch real speech, try again`);
+        return;
+      }
+      // Show the user what we heard before sending.
+      setCurrentPhrase(`→ ${text}`);
       void sendMessage(text);
     } catch (err) {
       console.error("[transcribe]", err);
