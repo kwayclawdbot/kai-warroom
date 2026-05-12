@@ -303,31 +303,39 @@ export default function Home() {
     }
     setChatError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      const mime = pickRecorderMime();
-      const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+      // Simple constraints — Safari can silently mute the mic when
+      // echoCancellation is true and the TTS audio is also active.
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const track = stream.getAudioTracks()[0];
+      console.log(
+        "[mic] track",
+        track?.label,
+        "enabled:",
+        track?.enabled,
+        "muted:",
+        track?.muted,
+        "readyState:",
+        track?.readyState,
+      );
+      // Let MediaRecorder pick its own supported MIME — Safari can lie about
+      // mp4 support in isTypeSupported but fails when you force it.
+      const mr = new MediaRecorder(stream);
       const chunks: Blob[] = [];
       mr.ondataavailable = (e) => {
+        console.log("[mic] data", e.data.size, "bytes");
         if (e.data.size > 0) chunks.push(e.data);
       };
       const stopPromise = new Promise<Blob>((resolve) => {
         mr.onstop = () => {
           const blob = new Blob(chunks, {
-            type: mime ?? "audio/webm",
+            type: mr.mimeType || "audio/webm",
           });
           stream.getTracks().forEach((t) => t.stop());
           resolve(blob);
         };
       });
-      // No timeslice — Safari's MediaRecorder produces malformed mp4 chunks
-      // when start() is called with an interval. Deliver one valid blob on stop.
       mr.start();
+      console.log("[mic] started, recorder.mimeType =", mr.mimeType);
 
       recorderRef.current = {
         stop: () => {
@@ -395,20 +403,14 @@ export default function Home() {
         setChatError("didn't catch that — try again");
         return;
       }
-      // Filter Whisper hallucinations on silence/noise.
-      const lower = text.toLowerCase().replace(/[.!?,]/g, "");
-      const HALLUCINATIONS = new Set([
-        "thanks for watching",
-        "thank you",
-        "thank you for watching",
-        "you",
-        "hi",
-        "hello",
-        "okay",
-        "ok",
-        "bye",
-      ]);
-      if (HALLUCINATIONS.has(lower) || lower.length < 3) {
+      // Filter the most common Whisper silence-hallucinations only.
+      const lower = text.toLowerCase().replace(/[.!?,]/g, "").trim();
+      if (
+        lower === "thanks for watching" ||
+        lower === "thank you for watching" ||
+        lower === "you" ||
+        lower.length < 2
+      ) {
         setChatError(`heard "${text}" — didn't catch real speech, try again`);
         return;
       }
