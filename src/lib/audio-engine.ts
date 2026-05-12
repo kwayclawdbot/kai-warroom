@@ -1,15 +1,13 @@
-// Audio playback + real-time frequency-band analysis for the brain visualizer.
+// Audio playback + mic capture + real-time frequency-band analysis for the
+// brain visualizer.
 //
-// On each chat response, we:
-//   1. Decode the base64 mp3 → Blob → object URL
-//   2. Create an <Audio> element + MediaElementSourceNode bound to it
-//   3. Pipe through a shared AnalyserNode → AudioContext.destination
-//   4. raf-loop reads the analyser's frequency bins → splits into bass/mid/
-//      treble → writes to the avatar store → drives the cloud glow
+// Single AnalyserNode shared between playback (TTS) and capture (mic). Each
+// audio source routes to the analyser separately; playback sources also
+// route to destination (so we hear them), mic sources do NOT (no feedback).
 //
-// AudioContext can only be created after a user gesture (autoplay policy).
-// Callers must invoke `ensureAudioCtx()` synchronously from within an event
-// handler the first time, or pass `resume: true` to `play()`.
+// AudioContext can only be created after a user gesture (browser autoplay
+// policy). Callers must invoke `resume()` from within an event handler the
+// first time.
 
 import { useAvatar } from "./avatar-store";
 
@@ -17,20 +15,31 @@ class AudioEngine {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private rafId: number | null = null;
+
+  // Playback (TTS).
   private currentSource: MediaElementAudioSourceNode | null = null;
   private currentAudio: HTMLAudioElement | null = null;
   private currentObjectUrl: string | null = null;
+
+  // Mic capture.
+  private currentMicSource: MediaStreamAudioSourceNode | null = null;
+  private currentMicStream: MediaStream | null = null;
 
   private ensure() {
     if (this.ctx && this.analyser) {
       return { ctx: this.ctx, analyser: this.analyser };
     }
-    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
     const ctx = new AC();
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.55;
-    analyser.connect(ctx.destination);
+    // NOTE: analyser is NOT connected to destination. Each playback source
+    // wires itself to both analyser and destination separately. Mic sources
+    // wire only to analyser — no feedback to speakers.
     this.ctx = ctx;
     this.analyser = analyser;
     return { ctx, analyser };
@@ -41,7 +50,7 @@ class AudioEngine {
     if (ctx.state === "suspended") await ctx.resume();
   }
 
-  /** Play an mp3 (base64 or url). Returns the audio element. */
+  /** Play an mp3 (base64). AnalyserNode drives the avatar bands. */
   async play(
     audioBase64: string,
     mime: string = "audio/mpeg",
@@ -49,10 +58,9 @@ class AudioEngine {
     const { ctx, analyser } = this.ensure();
     if (ctx.state === "suspended") await ctx.resume();
 
-    // Clean up previous playback.
     this.stop();
+    this.stopMic();
 
-    // Decode base64 → Blob → object URL.
     const binary = atob(audioBase64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -64,6 +72,7 @@ class AudioEngine {
 
     const source = ctx.createMediaElementSource(audio);
     source.connect(analyser);
+    source.connect(ctx.destination); // route to speakers too
 
     this.currentAudio = audio;
     this.currentSource = source;
@@ -83,7 +92,6 @@ class AudioEngine {
     return audio;
   }
 
-  /** Stop playback and reset bands. */
   stop() {
     if (this.currentAudio) {
       try {
@@ -110,7 +118,40 @@ class AudioEngine {
     this.currentAudio = null;
     this.currentSource = null;
     this.currentObjectUrl = null;
-    this.cleanupBands();
+    if (!this.currentMicSource) this.cleanupBands();
+  }
+
+  /**
+   * Pipe a live mic stream through the analyser so the brain reacts to the
+   * user's voice while recording. Does NOT route to destination — no feedback.
+   */
+  startMic(stream: MediaStream) {
+    const { ctx, analyser } = this.ensure();
+    if (ctx.state === "suspended") void ctx.resume();
+    this.stopMic();
+    this.stop();
+
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(analyser);
+    this.currentMicSource = src;
+    this.currentMicStream = stream;
+    this.startBandReader();
+  }
+
+  stopMic() {
+    if (this.currentMicSource) {
+      try {
+        this.currentMicSource.disconnect();
+      } catch {
+        /* ignore */
+      }
+      this.currentMicSource = null;
+    }
+    if (this.currentMicStream) {
+      this.currentMicStream.getTracks().forEach((t) => t.stop());
+      this.currentMicStream = null;
+    }
+    if (!this.currentSource) this.cleanupBands();
   }
 
   private cleanupBands() {
@@ -127,10 +168,10 @@ class AudioEngine {
 
     const tick = () => {
       analyser.getByteFrequencyData(data);
-      // fftSize 256 @ 48kHz → 128 bins, ~187Hz each.
+      // fftSize 256 → 128 bins. Approximate vocal bands:
       // bass:    bin 0-3   (~0-750Hz)
       // mid:     bin 4-31  (~750-6000Hz)
-      // treble:  bin 32-127 (~6kHz+)
+      // treble:  bin 32+   (~6kHz+)
       let bassSum = 0;
       let midSum = 0;
       let trebleSum = 0;
@@ -140,7 +181,6 @@ class AudioEngine {
       const bass = bassSum / 4 / 255;
       const mid = midSum / 28 / 255;
       const treble = trebleSum / (data.length - 32) / 255;
-      // Boost intensity slightly so quiet speech still drives glow visibly.
       const intensity = Math.min(1, bass * 0.6 + mid * 0.6 + treble * 0.3);
 
       const s = useAvatar.getState();

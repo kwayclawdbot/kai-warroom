@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
 import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
@@ -50,6 +50,23 @@ function nextMode(m: DemoMode): DemoMode {
 
 const VALID_REGION_IDS = new Set<string>(REGIONS.map((r) => r.id));
 
+/** Pick the best MIME the browser supports for MediaRecorder. */
+function pickRecorderMime(): string | undefined {
+  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
+    return undefined;
+  }
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+    "audio/ogg;codecs=opus",
+  ];
+  for (const m of candidates) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return undefined;
+}
+
 export default function Home() {
   const setIntensity = useAvatar((s) => s.setIntensity);
   const setBands = useAvatar((s) => s.setBands);
@@ -65,14 +82,21 @@ export default function Home() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [currentPhrase, setCurrentPhrase] = useState<string | null>(null);
 
+  // Mic / STT state.
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const recorderRef = useRef<{
+    stop: () => Promise<Blob>;
+  } | null>(null);
+
   const modeRef = useRef(mode);
   modeRef.current = mode;
   const chatPlayingRef = useRef(chatPlaying);
   chatPlayingRef.current = chatPlaying;
 
-  // ─── Thinking mode (suspended while chatting) ─────────────────────────
+  // ─── Demo loops (suspended while chatting / recording) ────────────────
   useEffect(() => {
-    if (mode !== "thinking" || chatPlaying) return;
+    if (mode !== "thinking" || chatPlaying || recording) return;
     const timeouts: number[] = [];
     setIntensity(0);
     setBands(0, 0, 0);
@@ -96,6 +120,7 @@ export default function Home() {
   }, [
     mode,
     chatPlaying,
+    recording,
     pulseRegion,
     clearRegions,
     setIntensity,
@@ -103,9 +128,8 @@ export default function Home() {
     stopSpeaking,
   ]);
 
-  // ─── Speaking demo (suspended while chatting) ─────────────────────────
   useEffect(() => {
-    if (mode !== "speaking" || chatPlaying) return;
+    if (mode !== "speaking" || chatPlaying || recording) return;
     startSpeaking();
 
     let raf = 0;
@@ -158,6 +182,7 @@ export default function Home() {
   }, [
     mode,
     chatPlaying,
+    recording,
     setIntensity,
     setBands,
     startSpeaking,
@@ -166,9 +191,8 @@ export default function Home() {
     clearRegions,
   ]);
 
-  // ─── Off mode ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (mode !== "off" || chatPlaying) return;
+    if (mode !== "off" || chatPlaying || recording) return;
     setIntensity(0);
     setBands(0, 0, 0);
     stopSpeaking();
@@ -177,75 +201,235 @@ export default function Home() {
   }, [
     mode,
     chatPlaying,
+    recording,
     setIntensity,
     setBands,
     stopSpeaking,
     clearRegions,
   ]);
 
-  // ─── Chat send ────────────────────────────────────────────────────────
-  async function handleSend(e?: React.FormEvent) {
-    e?.preventDefault();
-    if (!chatInput.trim() || chatLoading || chatPlaying || !audioEngine) return;
-    const message = chatInput.trim();
-    setChatInput("");
-    setChatError(null);
-    setChatLoading(true);
-    // User gesture — safe to resume the AudioContext now.
-    await audioEngine.resume();
+  // ─── Send a message (text from input OR transcribed from mic) ─────────
+  const sendMessage = useCallback(
+    async (message: string) => {
+      if (!message.trim() || chatLoading || chatPlaying || !audioEngine) return;
+      setChatError(null);
+      setChatLoading(true);
+      await audioEngine.resume();
 
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: message.trim() }),
+        });
+        if (!res.ok) {
+          const body = await res
+            .json()
+            .catch(() => ({}) as { error?: string });
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        const data: ChatResponse = await res.json();
+
+        setChatPlaying(true);
+        clearRegions();
+        setCurrentPhrase(data.text);
+        startSpeaking();
+
+        const pulseTimeouts: number[] = [];
+        data.regions.forEach((r) => {
+          if (!VALID_REGION_IDS.has(r.id)) return;
+          const id = window.setTimeout(() => {
+            pulseRegion(r.id as RegionId, r.peak, r.decay_ms);
+          }, Math.max(0, r.at_second * 1000));
+          pulseTimeouts.push(id);
+        });
+
+        const audio = await audioEngine.play(
+          data.audio_base64,
+          data.audio_mime ?? "audio/mpeg",
+        );
+        audio.addEventListener(
+          "ended",
+          () => {
+            for (const id of pulseTimeouts) window.clearTimeout(id);
+            setChatPlaying(false);
+            setCurrentPhrase(null);
+            stopSpeaking();
+          },
+          { once: true },
+        );
+      } catch (err) {
+        console.error("[chat]", err);
+        setChatError(err instanceof Error ? err.message : "send failed");
+        setChatPlaying(false);
+        stopSpeaking();
+      } finally {
+        setChatLoading(false);
+      }
+    },
+    [
+      chatLoading,
+      chatPlaying,
+      clearRegions,
+      pulseRegion,
+      startSpeaking,
+      stopSpeaking,
+    ],
+  );
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const msg = chatInput.trim();
+    if (!msg) return;
+    setChatInput("");
+    void sendMessage(msg);
+  }
+
+  // ─── Mic: hold to record, release to transcribe + auto-send ───────────
+  const startRecording = useCallback(async () => {
+    if (
+      recording ||
+      transcribing ||
+      chatLoading ||
+      chatPlaying ||
+      !audioEngine
+    ) {
+      return;
+    }
+    setChatError(null);
     try {
-      const res = await fetch("/api/chat", {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const mime = pickRecorderMime();
+      const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+      const chunks: Blob[] = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      const stopPromise = new Promise<Blob>((resolve) => {
+        mr.onstop = () => {
+          const blob = new Blob(chunks, {
+            type: mime ?? "audio/webm",
+          });
+          stream.getTracks().forEach((t) => t.stop());
+          resolve(blob);
+        };
+      });
+      mr.start(120);
+
+      recorderRef.current = {
+        stop: () => {
+          if (mr.state !== "inactive") mr.stop();
+          return stopPromise;
+        },
+      };
+      // Pipe mic through the audio engine's analyser so the brain reacts
+      // to the user's voice while recording.
+      await audioEngine.resume();
+      audioEngine.startMic(stream);
+      setRecording(true);
+    } catch (err) {
+      console.error("[mic]", err);
+      const msg = err instanceof Error ? err.message : "mic access failed";
+      setChatError(msg.includes("denied") ? "Mic access denied" : msg);
+    }
+  }, [chatLoading, chatPlaying, recording, transcribing]);
+
+  const stopRecording = useCallback(async () => {
+    const handle = recorderRef.current;
+    if (!handle) return;
+    recorderRef.current = null;
+    setRecording(false);
+    audioEngine?.stopMic();
+
+    let blob: Blob;
+    try {
+      blob = await handle.stop();
+    } catch (err) {
+      console.error("[mic stop]", err);
+      setChatError("recording failed");
+      return;
+    }
+    if (blob.size < 1500) return; // ~120ms — too short, ignore taps
+
+    setTranscribing(true);
+    try {
+      const form = new FormData();
+      form.append("audio", blob, "mic.webm");
+      const res = await fetch("/api/transcribe", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
+        body: form,
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}) as { error?: string });
+        const body = await res
+          .json()
+          .catch(() => ({}) as { error?: string });
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
-      const data: ChatResponse = await res.json();
-
-      // Switch to chat playback — pauses demos.
-      setChatPlaying(true);
-      clearRegions();
-      setCurrentPhrase(data.text);
-      startSpeaking();
-
-      // Schedule region pulses at the timestamps the server estimated.
-      const pulseTimeouts: number[] = [];
-      data.regions.forEach((r) => {
-        if (!VALID_REGION_IDS.has(r.id)) return;
-        const id = window.setTimeout(() => {
-          pulseRegion(r.id as RegionId, r.peak, r.decay_ms);
-        }, Math.max(0, r.at_second * 1000));
-        pulseTimeouts.push(id);
-      });
-
-      // Play audio — AnalyserNode in audio-engine drives intensity/bands.
-      const audio = await audioEngine.play(
-        data.audio_base64,
-        data.audio_mime ?? "audio/mpeg",
-      );
-      audio.addEventListener(
-        "ended",
-        () => {
-          for (const id of pulseTimeouts) window.clearTimeout(id);
-          setChatPlaying(false);
-          setCurrentPhrase(null);
-          stopSpeaking();
-        },
-        { once: true },
-      );
+      const data: { text?: string } = await res.json();
+      const text = (data.text ?? "").trim();
+      setTranscribing(false);
+      if (!text) {
+        setChatError("didn't catch that — try again");
+        return;
+      }
+      // Auto-send the transcript.
+      void sendMessage(text);
     } catch (err) {
-      console.error("[chat]", err);
-      setChatError(err instanceof Error ? err.message : "send failed");
-      setChatPlaying(false);
-      stopSpeaking();
-    } finally {
-      setChatLoading(false);
+      console.error("[transcribe]", err);
+      setChatError(err instanceof Error ? err.message : "transcribe failed");
+      setTranscribing(false);
     }
-  }
+  }, [sendMessage]);
+
+  // Spacebar = push-to-talk (when not focused in input).
+  useEffect(() => {
+    function isTypingTarget(el: EventTarget | null) {
+      const node = el as HTMLElement | null;
+      if (!node) return false;
+      const tag = node.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        node.isContentEditable === true
+      );
+    }
+    function onDown(e: KeyboardEvent) {
+      if (e.code !== "Space" || e.repeat) return;
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      void startRecording();
+    }
+    function onUp(e: KeyboardEvent) {
+      if (e.code !== "Space") return;
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      void stopRecording();
+    }
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+    };
+  }, [startRecording, stopRecording]);
+
+  const micDisabled =
+    chatLoading || chatPlaying || transcribing;
+  const micActiveLabel = transcribing
+    ? "thinking…"
+    : recording
+      ? "listening…"
+      : chatPlaying
+        ? "speaking"
+        : chatLoading
+          ? "loading"
+          : "hold to talk · or hit space";
 
   return (
     <main className="relative flex-1 overflow-hidden bg-[#05080A] text-white">
@@ -254,10 +438,10 @@ export default function Home() {
           kai · brain
         </div>
         <div className="flex flex-col items-end gap-1 text-[10px] uppercase tracking-[0.2em] text-amber-200/70 font-mono">
-          <div>v1.0 · scroll to zoom · drag to orbit</div>
+          <div>v1.1 · hold mic or space to talk</div>
           <button
             onClick={() => setMode(nextMode)}
-            disabled={chatPlaying || chatLoading}
+            disabled={chatPlaying || chatLoading || recording || transcribing}
             className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white disabled:opacity-40 disabled:hover:border-white/15"
           >
             {MODE_LABELS[mode]}
@@ -273,23 +457,81 @@ export default function Home() {
           {currentPhrase ?? ""}
         </div>
 
-        {/* Chat input */}
+        {/* Mic button (push-to-talk) */}
+        <div className="pointer-events-auto flex flex-col items-center gap-2">
+          <button
+            type="button"
+            aria-label="hold to talk to Kai"
+            disabled={micDisabled}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              void startRecording();
+            }}
+            onPointerUp={(e) => {
+              e.preventDefault();
+              void stopRecording();
+            }}
+            onPointerLeave={() => {
+              if (recording) void stopRecording();
+            }}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`relative h-16 w-16 rounded-full flex items-center justify-center border transition-all select-none ${
+              recording
+                ? "bg-red-500/20 border-red-400/60 text-red-200 scale-110 shadow-[0_0_30px_rgba(248,113,113,0.45)]"
+                : transcribing
+                  ? "bg-amber-400/15 border-amber-300/40 text-amber-200"
+                  : micDisabled
+                    ? "bg-white/5 border-white/15 text-white/30 cursor-not-allowed"
+                    : "bg-emerald-400/10 border-emerald-300/30 text-emerald-200 hover:bg-emerald-400/20 hover:scale-105"
+            }`}
+          >
+            {recording && (
+              <span className="absolute inset-0 rounded-full border border-red-400/40 animate-ping" />
+            )}
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-7 w-7 relative"
+              aria-hidden
+            >
+              <rect x="9" y="3" width="6" height="12" rx="3" />
+              <path d="M5 11a7 7 0 0 0 14 0" />
+              <line x1="12" y1="18" x2="12" y2="22" />
+              <line x1="8" y1="22" x2="16" y2="22" />
+            </svg>
+          </button>
+          <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-white/50">
+            {micActiveLabel}
+          </div>
+        </div>
+
+        {/* Chat input — text fallback */}
         <form
-          onSubmit={handleSend}
+          onSubmit={handleSubmit}
           className="pointer-events-auto flex w-full max-w-md items-stretch gap-2"
         >
           <input
             type="text"
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
-            placeholder="ask Kai anything..."
-            disabled={chatLoading || chatPlaying}
+            placeholder="or type and Kai will speak the reply…"
+            disabled={chatLoading || chatPlaying || recording || transcribing}
             className="flex-1 rounded-lg border border-white/10 bg-black/55 px-3.5 py-2 text-xs text-white/85 placeholder:text-white/30 outline-none focus:border-emerald-400/40 disabled:opacity-50"
             aria-label="message Kai"
           />
           <button
             type="submit"
-            disabled={!chatInput.trim() || chatLoading || chatPlaying}
+            disabled={
+              !chatInput.trim() ||
+              chatLoading ||
+              chatPlaying ||
+              recording ||
+              transcribing
+            }
             className="rounded-lg border border-emerald-300/30 bg-emerald-400/15 px-3 text-[11px] uppercase tracking-[0.18em] text-emerald-200 transition hover:bg-emerald-400/25 disabled:cursor-not-allowed disabled:opacity-30"
           >
             {chatLoading ? "…" : chatPlaying ? "playing" : "send"}
