@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
 import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
+import { audioEngine, type ChatResponse } from "@/lib/audio-engine";
 
 const KaiBrain = dynamic(
   () => import("@/components/avatar/KaiBrain").then((m) => m.KaiBrain),
@@ -47,6 +48,8 @@ function nextMode(m: DemoMode): DemoMode {
   return "off";
 }
 
+const VALID_REGION_IDS = new Set<string>(REGIONS.map((r) => r.id));
+
 export default function Home() {
   const setIntensity = useAvatar((s) => s.setIntensity);
   const setBands = useAvatar((s) => s.setBands);
@@ -56,13 +59,20 @@ export default function Home() {
   const clearRegions = useAvatar((s) => s.clearRegions);
 
   const [mode, setMode] = useState<DemoMode>("speaking");
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatPlaying, setChatPlaying] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [currentPhrase, setCurrentPhrase] = useState<string | null>(null);
+
   const modeRef = useRef(mode);
   modeRef.current = mode;
+  const chatPlayingRef = useRef(chatPlaying);
+  chatPlayingRef.current = chatPlaying;
 
-  // ─── Thinking mode: scripted analysis sequence (no audio) ──────────────
+  // ─── Thinking mode (suspended while chatting) ─────────────────────────
   useEffect(() => {
-    if (mode !== "thinking") return;
+    if (mode !== "thinking" || chatPlaying) return;
     const timeouts: number[] = [];
     setIntensity(0);
     setBands(0, 0, 0);
@@ -70,7 +80,7 @@ export default function Home() {
     const runCycle = () => {
       for (const beat of ANALYSIS_SEQUENCE) {
         const id = window.setTimeout(() => {
-          if (modeRef.current !== "thinking") return;
+          if (modeRef.current !== "thinking" || chatPlayingRef.current) return;
           pulseRegion(beat.id, beat.peak, beat.decayMs);
         }, beat.at * 1000);
         timeouts.push(id);
@@ -85,6 +95,7 @@ export default function Home() {
     };
   }, [
     mode,
+    chatPlaying,
     pulseRegion,
     clearRegions,
     setIntensity,
@@ -92,9 +103,9 @@ export default function Home() {
     stopSpeaking,
   ]);
 
-  // ─── Speaking mode: phrase program with syllable-driven audio bands ────
+  // ─── Speaking demo (suspended while chatting) ─────────────────────────
   useEffect(() => {
-    if (mode !== "speaking") return;
+    if (mode !== "speaking" || chatPlaying) return;
     startSpeaking();
 
     let raf = 0;
@@ -106,13 +117,12 @@ export default function Home() {
     );
 
     const tick = () => {
-      if (modeRef.current !== "speaking") return;
+      if (modeRef.current !== "speaking" || chatPlayingRef.current) return;
       const now = performance.now();
       const entry = SPEECH_PROGRAM[entryIdx];
       const elapsed = (now - entryStart) / 1000;
 
       if (elapsed >= entry.duration) {
-        // Advance.
         entryIdx = (entryIdx + 1) % SPEECH_PROGRAM.length;
         entryStart = now;
         pulsedSet.clear();
@@ -122,7 +132,6 @@ export default function Home() {
         const env = speakingEnvelope(elapsed);
         setIntensity(env.intensity);
         setBands(env.bass, env.mid, env.treble);
-        // Fire region pulses at their scheduled fractional offsets.
         entry.regions.forEach((r, i) => {
           if (!pulsedSet.has(i) && elapsed >= r.at * entry.duration) {
             pulsedSet.add(i);
@@ -130,7 +139,6 @@ export default function Home() {
           }
         });
       } else {
-        // Pause — fade audio out quickly.
         setIntensity(0);
         setBands(0, 0, 0);
       }
@@ -149,6 +157,7 @@ export default function Home() {
     };
   }, [
     mode,
+    chatPlaying,
     setIntensity,
     setBands,
     startSpeaking,
@@ -157,15 +166,86 @@ export default function Home() {
     clearRegions,
   ]);
 
-  // ─── Off mode cleanup ─────────────────────────────────────────────────
+  // ─── Off mode ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (mode !== "off") return;
+    if (mode !== "off" || chatPlaying) return;
     setIntensity(0);
     setBands(0, 0, 0);
     stopSpeaking();
     clearRegions();
     setCurrentPhrase(null);
-  }, [mode, setIntensity, setBands, stopSpeaking, clearRegions]);
+  }, [
+    mode,
+    chatPlaying,
+    setIntensity,
+    setBands,
+    stopSpeaking,
+    clearRegions,
+  ]);
+
+  // ─── Chat send ────────────────────────────────────────────────────────
+  async function handleSend(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!chatInput.trim() || chatLoading || chatPlaying || !audioEngine) return;
+    const message = chatInput.trim();
+    setChatInput("");
+    setChatError(null);
+    setChatLoading(true);
+    // User gesture — safe to resume the AudioContext now.
+    await audioEngine.resume();
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}) as { error?: string });
+        throw new Error(body.error ?? `HTTP ${res.status}`);
+      }
+      const data: ChatResponse = await res.json();
+
+      // Switch to chat playback — pauses demos.
+      setChatPlaying(true);
+      clearRegions();
+      setCurrentPhrase(data.text);
+      startSpeaking();
+
+      // Schedule region pulses at the timestamps the server estimated.
+      const pulseTimeouts: number[] = [];
+      data.regions.forEach((r) => {
+        if (!VALID_REGION_IDS.has(r.id)) return;
+        const id = window.setTimeout(() => {
+          pulseRegion(r.id as RegionId, r.peak, r.decay_ms);
+        }, Math.max(0, r.at_second * 1000));
+        pulseTimeouts.push(id);
+      });
+
+      // Play audio — AnalyserNode in audio-engine drives intensity/bands.
+      const audio = await audioEngine.play(
+        data.audio_base64,
+        data.audio_mime ?? "audio/mpeg",
+      );
+      audio.addEventListener(
+        "ended",
+        () => {
+          for (const id of pulseTimeouts) window.clearTimeout(id);
+          setChatPlaying(false);
+          setCurrentPhrase(null);
+          stopSpeaking();
+        },
+        { once: true },
+      );
+    } catch (err) {
+      console.error("[chat]", err);
+      setChatError(err instanceof Error ? err.message : "send failed");
+      setChatPlaying(false);
+      stopSpeaking();
+    } finally {
+      setChatLoading(false);
+    }
+  }
 
   return (
     <main className="relative flex-1 overflow-hidden bg-[#05080A] text-white">
@@ -174,10 +254,11 @@ export default function Home() {
           kai · brain
         </div>
         <div className="flex flex-col items-end gap-1 text-[10px] uppercase tracking-[0.2em] text-amber-200/70 font-mono">
-          <div>v0.3 · scroll to zoom · drag to orbit</div>
+          <div>v1.0 · scroll to zoom · drag to orbit</div>
           <button
             onClick={() => setMode(nextMode)}
-            className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white"
+            disabled={chatPlaying || chatLoading}
+            className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white disabled:opacity-40 disabled:hover:border-white/15"
           >
             {MODE_LABELS[mode]}
           </button>
@@ -187,13 +268,41 @@ export default function Home() {
       <KaiBrain />
 
       <footer className="absolute bottom-0 left-0 right-0 z-10 flex flex-col items-center gap-3 px-4 pb-6 pt-3 pointer-events-none">
-        {/* Caption strip — shows what Kai is currently "saying" */}
-        <div className="min-h-[1rem] font-mono text-[11px] uppercase tracking-[0.18em] text-amber-100/75">
+        {/* Caption strip */}
+        <div className="min-h-[2.5rem] max-w-3xl text-center font-mono text-[11px] uppercase tracking-[0.18em] text-amber-100/80 leading-relaxed pointer-events-none">
           {currentPhrase ?? ""}
         </div>
-        <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-white/30">
-          tap a region to fire it manually
-        </div>
+
+        {/* Chat input */}
+        <form
+          onSubmit={handleSend}
+          className="pointer-events-auto flex w-full max-w-md items-stretch gap-2"
+        >
+          <input
+            type="text"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="ask Kai anything..."
+            disabled={chatLoading || chatPlaying}
+            className="flex-1 rounded-lg border border-white/10 bg-black/55 px-3.5 py-2 text-xs text-white/85 placeholder:text-white/30 outline-none focus:border-emerald-400/40 disabled:opacity-50"
+            aria-label="message Kai"
+          />
+          <button
+            type="submit"
+            disabled={!chatInput.trim() || chatLoading || chatPlaying}
+            className="rounded-lg border border-emerald-300/30 bg-emerald-400/15 px-3 text-[11px] uppercase tracking-[0.18em] text-emerald-200 transition hover:bg-emerald-400/25 disabled:cursor-not-allowed disabled:opacity-30"
+          >
+            {chatLoading ? "…" : chatPlaying ? "playing" : "send"}
+          </button>
+        </form>
+
+        {chatError && (
+          <div className="pointer-events-auto rounded-sm border border-red-500/30 bg-red-500/10 px-3 py-1 text-[10px] text-red-200">
+            {chatError}
+          </div>
+        )}
+
+        {/* Manual region triggers */}
         <div className="pointer-events-auto flex flex-wrap justify-center gap-1.5">
           {REGIONS.map((r) => (
             <button
