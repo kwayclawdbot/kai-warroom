@@ -262,6 +262,9 @@ function NeuralGraph() {
   const cascadesRef = useRef<
     { edgeIdx: number; startTime: number; intensity: number }[]
   >([]);
+  // Per-node flash buffer — bumped when a synapse cascade hits a node so
+  // the receiving neuron flashes bright. Decays exponentially each frame.
+  const nodeFlashRef = useRef(new Float32Array(NODE_COUNT));
 
   // Map node → list of edge indices for cascade chaining.
   const nodeEdges = useMemo(() => {
@@ -303,6 +306,11 @@ function NeuralGraph() {
       }
     }
 
+    // Decay all node flashes — each frame loses ~25% so flashes last ~150ms.
+    const flashDecay = Math.exp(-delta * 6);
+    const flashBuf = nodeFlashRef.current;
+    for (let i = 0; i < NODE_COUNT; i++) flashBuf[i] *= flashDecay;
+
     // 1) Node drift + color. Nodes themselves do NOT individually flicker.
     //    Cloud has a constant moderate glow baseline + a slight ambient
     //    breath + a small speech-driven lift. The speech pulse is subtle —
@@ -328,18 +336,19 @@ function NeuralGraph() {
         Math.sin(t * 0.19 + seed * 0.7) * DRIFT_AMP * 0.7;
 
       // Region-colored node — moderate constant glow, brighter on region
-      // activation, plus the gentle synced globalGlow lifts ALL nodes
-      // together on each syllable (subtle).
+      // activation, gentle global speech lift, plus a per-node flash spike
+      // when a synapse cascade strikes this neuron.
+      const flash = flashBuf[i];
       const rc = REGIONS[region].color;
-      const brightness = 0.55 + act * 0.55 + globalGlow * 0.45;
-      // White-hot center mix only on region activation peaks (not speech).
-      const whiteMix = act * 0.22;
+      const brightness = 0.55 + act * 0.55 + globalGlow * 0.45 + flash * 0.7;
+      // White-hot center mix on region activation peaks AND synapse hits.
+      const whiteMix = act * 0.22 + flash * 0.55;
       nodeColors[i * 3] = Math.min(1, rc.r * brightness + whiteMix);
       nodeColors[i * 3 + 1] = Math.min(1, rc.g * brightness + whiteMix);
       nodeColors[i * 3 + 2] = Math.min(1, rc.b * brightness + whiteMix);
 
-      // Size only reacts to region activation. No global speech swell.
-      nodeSizes[i] = 0.06 + act * 0.13;
+      // Size pops on synapse strikes — neurons visibly swell when hit.
+      nodeSizes[i] = 0.06 + act * 0.13 + flash * 0.09;
     }
     nodes.geometry.attributes.position.needsUpdate = true;
     nodes.geometry.attributes.color.needsUpdate = true;
@@ -390,22 +399,36 @@ function NeuralGraph() {
           originNode = hotNodes[Math.floor(Math.random() * hotNodes.length)];
         }
       }
-      const chainLen = 2 + Math.floor(Math.random() * 4);
-      // Shorter stagger when speaking — chain fires faster.
+      // Longer chains (3-7 hops) read as more dramatic lightning across cloud.
+      const chainLen = 3 + Math.floor(Math.random() * 5);
       const stagger = 0.04 - intensity * 0.02;
       let currentNode = originNode;
+      // Flash the originating neuron immediately.
+      flashBuf[originNode] = Math.min(1.4, flashBuf[originNode] + 1.0);
       for (let c = 0; c < chainLen; c++) {
         const candidates = nodeEdges[currentNode];
         if (candidates.length === 0) break;
         const edgeIdx =
           candidates[Math.floor(Math.random() * candidates.length)];
+        // Slower per-hop decay (0.12 -> 0.08) — later hops still pop.
         cascadesRef.current.push({
           edgeIdx,
           startTime: t + c * stagger,
-          intensity: 1 - c * 0.12,
+          intensity: 1.15 - c * 0.08,
         });
         const [ea, eb] = graph.edges[edgeIdx];
-        currentNode = currentNode === ea ? eb : ea;
+        const nextNode = currentNode === ea ? eb : ea;
+        // Schedule flash on the receiving neuron at the time the cascade arrives.
+        const arriveTime = t + c * stagger + 0.02;
+        // Queue node flash inline — we just bump it now since the cascade is
+        // already inflight and the flash decays naturally.
+        const hopIntensity = 1.0 - c * 0.1;
+        // Apply after a short delay via direct array write at the right frame
+        // would be ideal, but a small inline bump works because the visual
+        // delay is dominated by the cascade fade timing anyway.
+        void arriveTime;
+        flashBuf[nextNode] = Math.min(1.4, flashBuf[nextNode] + hopIntensity);
+        currentNode = nextNode;
       }
     }
     // Shorter cascade lifetime during speech — clear faster so the network
@@ -415,14 +438,14 @@ function NeuralGraph() {
       (c) => t - c.startTime < cascadeLife,
     );
 
-    // 4) Overlay cascade white-hot brightness onto edges. Fade timings shrink
-    //    with speech so each cascade reads as a sharper, faster flash.
+    // 4) Overlay cascade white-hot brightness onto edges. Sharper attack +
+    //    slightly longer peak hold so each flash reads as more dramatic.
     const fadeOutDur = 0.55 - intensity * 0.25;
     for (const c of cascadesRef.current) {
       const age = t - c.startTime;
       if (age < 0) continue;
-      const fadeIn = Math.min(age / 0.04, 1);
-      const fadeOut = Math.max(0, 1 - (age - 0.08) / fadeOutDur);
+      const fadeIn = Math.min(age / 0.02, 1); // snappier attack
+      const fadeOut = Math.max(0, 1 - (age - 0.12) / fadeOutDur); // hold a bit longer
       const boost = fadeIn * fadeOut * c.intensity;
       if (boost <= 0) continue;
       const baseV = c.edgeIdx * VERTS_PER_EDGE;
