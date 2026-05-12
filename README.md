@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Kai War Room
 
-## Getting Started
+Your personal AI trading command center.
 
-First, run the development server:
+Voice-conversational interface for Kai — ask things like "what's the hottest trade right now?", "full analysis on RKLB", "weekly winners", "what are users saying today?" — and get back voice answers from a cinematic neural-cloud avatar, with supporting visual panels that slide in when relevant.
+
+Built to be accessed from any device (phone, laptop, iPad) and recordable for social media (9:16 mode + R-to-record).
+
+## Stack
+
+- **Next.js 16** (App Router, Turbopack) on Vercel
+- **React Three Fiber** for the Kai Cloud avatar (v2, GPU-accelerated, ~10k particles, audio-reactive bloom)
+- **FastAPI brain** on Railway (separate repo) with Claude Opus 4.7 tool-use over 5 Phase-1 tools
+- **Deepgram** streaming STT (ephemeral browser tokens, master key on the brain)
+- **Voicebox** TTS via Cloudflare Tunnel (Kway voice profile, local Qwen), OpenAI TTS auto-fallback
+- **Supabase** + **Polygon** + Railway `kai-agent` as data sources
+
+## Local dev
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
+cp .env.example .env.local  # fill in SHARED_PASSWORD + SESSION_SECRET
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open <http://localhost:3000>, enter the password, see the avatar stub.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Env vars
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Name | Where set | Purpose |
+| --- | --- | --- |
+| `SHARED_PASSWORD` | Vercel + local | Password to enter the War Room (just Kway for now) |
+| `SESSION_SECRET` | Vercel + local | HMAC secret signing the session cookie. Generate with `openssl rand -hex 32` |
+| `NEXT_PUBLIC_BRAIN_API_URL` | Vercel + local | URL of the kai-warroom-brain service on Railway |
+| `NEXT_PUBLIC_DEEPGRAM_TOKEN_ENDPOINT` | Vercel + local | Path on the brain that mints short-lived Deepgram tokens |
 
-## Learn More
+## Auth
 
-To learn more about Next.js, take a look at the following resources:
+The whole app sits behind a single shared password. Login at `/login` exchanges the password for an HMAC-signed session cookie (`kai_session`, 30-day TTL). `src/proxy.ts` enforces the gate on every non-auth route. Multi-user support comes in Phase 2.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Routes
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- `/login` — password gate
+- `/` — Avatar + push-to-talk + dock panels
+- `/api/auth` — POST password → session cookie
+- `/?obs=1` — OBS browser-source mode (no chrome, transparent bg) — wired in Task #9
 
-## Deploy on Vercel
+## Build order
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+This repo covers the frontend half (Tasks #1, #2, #6, #7, #8, #9). The brain server lives in a separate repo (`kai-warroom-brain`).
