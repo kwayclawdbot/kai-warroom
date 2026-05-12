@@ -138,19 +138,34 @@ function classifyIntent(message: string): "data" | "casual" {
 
 // Casual path system prompt — keeps gpt-4o-mini tight, on-character, and
 // bounces back to the full Kai loop if the user actually wants data.
-const CASUAL_SYSTEM_PROMPT =
-  "You are Kai — a sharp, fast-paced market vibes coach speaking out loud to a trader on the desk. Keep responses to 1–2 sentences, conversational, no lists. Personality: direct, encouraging, occasionally cheeky. Never ask the user to clarify. If they ask for data, prices, alerts, watchlist info, or specific tickers, say 'Hold on — switching to full Kai mode' and stop there.";
+const CASUAL_SYSTEM_PROMPT = `You're Kai — a buddy on the trading desk. Talk like a person, not an assistant.
+
+Sound like this: "Yeah I'm good, just watching the tape." / "Tough open, we'll see how it shapes up." / "Real talk, that idea's solid."
+
+Not like this: "Great question!" / "I'd be happy to help with that." / "Here are some thoughts..."
+
+One or two sentences. Contractions always. No bullet points, no preamble. If they ask about specific tickers, alerts, watchlist, or actual market data, just say "hold on, switching to full Kai" and stop.`;
 
 /**
  * Split text into sentence-sized chunks for sequential TTS rendering. Keeps
- * trailing punctuation. Trims and drops empty pieces.
+ * trailing punctuation. Decimal-aware (won't split "$198.50") and merges
+ * tiny fragments back into the previous sentence so words don't get clipped
+ * at chunk boundaries.
  */
 function splitSentences(text: string): string[] {
   const parts = text
-    .split(/(?<=[.!?])\s+/)
+    .split(/(?<=[.!?])(?<!\d\.\d?)(?<!\b[A-Z]\.)\s+(?=[A-Z"'\(])/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  return parts.length > 0 ? parts : [text.trim()];
+  const merged: string[] = [];
+  for (const s of parts) {
+    if (merged.length > 0 && (s.length < 12 || /^[\d%)\]]/.test(s))) {
+      merged[merged.length - 1] += " " + s;
+    } else {
+      merged.push(s);
+    }
+  }
+  return merged.length > 0 ? merged : [text.trim()];
 }
 
 /** NDJSON line: one JSON object per `\n`-terminated line. */
