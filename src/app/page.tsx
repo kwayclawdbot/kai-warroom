@@ -232,7 +232,6 @@ export default function Home() {
 
         setChatPlaying(true);
         clearRegions();
-        setCurrentPhrase(data.text);
         startSpeaking();
 
         const pulseTimeouts: number[] = [];
@@ -414,8 +413,6 @@ export default function Home() {
         setChatError(`heard "${text}" — didn't catch real speech, try again`);
         return;
       }
-      // Show the user what we heard before sending.
-      setCurrentPhrase(`→ ${text}`);
       void sendMessage(text);
     } catch (err) {
       console.error("[transcribe]", err);
