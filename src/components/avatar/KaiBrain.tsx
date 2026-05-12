@@ -16,8 +16,8 @@ const K_NEAREST = 4; // 2000 nodes × 4 nearest ≈ 4000 unique edges after dedu
 const EDGE_SEGMENTS = 6; // points along each bezier curve — fewer is fine since curves are gentler
 const VERTS_PER_EDGE = EDGE_SEGMENTS * 2; // line segments need 2 verts each
 // More compact + still slightly elongated front-back, with sagittal fissure.
-const ELLIPSOID = { x: 1.25, y: 1.1, z: 1.4 };
-const DRIFT_AMP = 0.045;
+const ELLIPSOID = { x: 0.88, y: 0.77, z: 0.98 };
+const DRIFT_AMP = 0.032;
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -484,7 +484,7 @@ export function KaiBrain() {
         }}
       />
       <Canvas
-        camera={{ position: [0, 0, 4.6], fov: 50 }}
+        camera={{ position: [0, 0, 3.2], fov: 50 }}
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true }}
         style={{ background: "transparent" }}
@@ -494,8 +494,8 @@ export function KaiBrain() {
           enableDamping
           dampingFactor={0.06}
           enablePan={false}
-          minDistance={3.0}
-          maxDistance={9}
+          minDistance={2.1}
+          maxDistance={6.5}
           rotateSpeed={0.5}
           zoomSpeed={0.6}
         />
