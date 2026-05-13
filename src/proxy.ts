@@ -3,7 +3,7 @@ import { refreshSupabaseSession } from "@/lib/supabase/middleware-helper";
 
 export const config = {
   matcher: [
-    "/((?!login|api/auth|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|woff2?)).*)",
+    "/((?!login|api/auth|design-preview|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|woff2?)).*)",
   ],
 };
 
