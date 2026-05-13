@@ -5,13 +5,24 @@ import {
   ColorType,
   createChart,
   CrosshairMode,
+  LineSeries,
   LineStyle,
+  type CandlestickData,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type LineData,
+  type Time,
 } from "lightweight-charts";
 import { useEffect, useImperativeHandle, useRef, type Ref } from "react";
 import { getBarsFor } from "@/lib/chart/sample-data";
+import {
+  emaPair,
+  heatmapCandleColor,
+  reversalBands,
+  rsi,
+  withAlpha,
+} from "@/lib/chart/cca-v5";
 
 type Bar = { time: string; open: number; high: number; low: number; close: number };
 
@@ -41,6 +52,12 @@ async function fetchBars(symbol: string): Promise<Bar[]> {
  *   • show_ticker(symbol)              → setTicker
  *   • draw_line(price, label, color)   → drawPriceLine
  *   • clear_annotations()              → clearAnnotations
+ *
+ * CCA v5 overlay toggles are also exposed for future tool wiring (not bound
+ * to the chat NDJSON path yet — Kai can flip them once we add a tool):
+ *   • setHeatmap(on)
+ *   • setEmaClouds(on)
+ *   • setReversalBands(on)
  */
 export type JarvisChartHandle = {
   setTicker: (symbol: string) => void;
@@ -50,6 +67,9 @@ export type JarvisChartHandle = {
     color?: "support" | "resistance" | "neutral",
   ) => void;
   clearAnnotations: () => void;
+  setHeatmap: (on: boolean) => void;
+  setEmaClouds: (on: boolean) => void;
+  setReversalBands: (on: boolean) => void;
 };
 
 type Props = {
@@ -63,12 +83,42 @@ const PRICE_LINE_COLORS = {
   neutral: "#fbbf24",      // amber (matches warroom palette)
 } as const;
 
+// Cloud line tones, low-alpha so the heatmap candles remain the focal point.
+const EMA_GREEN = "#22c55e";
+const EMA_RED = "#ef4444";
+// Reversal Band tones — match Pine palette (yellow/red upper, blue/green lower).
+const RB_COLORS = {
+  upper1: withAlpha("#facc15", 0.55), // yellow inner
+  upper2: withAlpha("#ef4444", 0.55), // red inner
+  upper3: withAlpha("#ef4444", 0.85), // red outer (brighter)
+  lower1: withAlpha("#3b82f6", 0.55), // blue inner
+  lower2: withAlpha("#3b82f6", 0.85), // blue outer
+  lower3: withAlpha("#22c55e", 0.55), // green outer
+};
+
 export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const tickerRef = useRef<HTMLSpanElement>(null);
+
+  // CCA v5 overlay series + state. Kept in refs so toggles can re-skin the
+  // chart without re-running the full setData pipeline.
+  const lastBarsRef = useRef<Bar[]>([]);
+  const emaFastShortRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const emaSlowShortRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const emaFastLongRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const emaSlowLongRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbUpper1Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbUpper2Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbUpper3Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbLower1Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbLower2Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const rbLower3Ref = useRef<ISeriesApi<"Line"> | null>(null);
+  const showHeatmapRef = useRef<boolean>(true);
+  const showEmaCloudsRef = useRef<boolean>(true);
+  const showReversalBandsRef = useRef<boolean>(true);
 
   // ── Init chart once on mount ───────────────────────────────────────────
   useEffect(() => {
@@ -100,6 +150,7 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
     });
 
     const candles = chart.addSeries(CandlestickSeries, {
+      // Base colors — overridden per-bar by the heatmap pipeline when on.
       upColor: "#34d399",
       downColor: "#f87171",
       borderUpColor: "#34d399",
@@ -108,17 +159,48 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       wickDownColor: "rgba(248,113,113,0.7)",
     });
 
+    // EMA cloud lines — two pairs (5/12 and 34/50). lastValueVisible/priceLine
+    // off so the right scale only labels candle price, not every overlay.
+    const lineCommon = {
+      lineWidth: 1 as const,
+      lastValueVisible: false,
+      priceLineVisible: false,
+      crosshairMarkerVisible: false,
+    };
+    const emaFastShort = chart.addSeries(LineSeries, { ...lineCommon, color: EMA_GREEN });
+    const emaSlowShort = chart.addSeries(LineSeries, { ...lineCommon, color: EMA_GREEN });
+    const emaFastLong = chart.addSeries(LineSeries, { ...lineCommon, color: EMA_GREEN });
+    const emaSlowLong = chart.addSeries(LineSeries, { ...lineCommon, color: EMA_GREEN });
+
+    // Reversal bands — six envelope lines.
+    const rbUpper1 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.upper1 });
+    const rbUpper2 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.upper2 });
+    const rbUpper3 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.upper3 });
+    const rbLower1 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.lower1 });
+    const rbLower2 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.lower2 });
+    const rbLower3 = chart.addSeries(LineSeries, { ...lineCommon, color: RB_COLORS.lower3 });
+
     chartRef.current = chart;
     seriesRef.current = candles;
+    emaFastShortRef.current = emaFastShort;
+    emaSlowShortRef.current = emaSlowShort;
+    emaFastLongRef.current = emaFastLong;
+    emaSlowLongRef.current = emaSlowLong;
+    rbUpper1Ref.current = rbUpper1;
+    rbUpper2Ref.current = rbUpper2;
+    rbUpper3Ref.current = rbUpper3;
+    rbLower1Ref.current = rbLower1;
+    rbLower2Ref.current = rbLower2;
+    rbLower3Ref.current = rbLower3;
 
     // Seed with sample for instant paint, then upgrade to live Polygon data.
-    candles.setData(getBarsFor(defaultTicker));
+    applyBars(getBarsFor(defaultTicker) as Bar[]);
     chart.timeScale().fitContent();
     if (tickerRef.current) tickerRef.current.textContent = defaultTicker;
     let cancelled = false;
     fetchBars(defaultTicker).then((bars) => {
       if (cancelled || !seriesRef.current) return;
-      seriesRef.current.setData(bars);
+      applyBars(bars);
       chartRef.current?.timeScale().fitContent();
     });
 
@@ -127,9 +209,131 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
+      emaFastShortRef.current = null;
+      emaSlowShortRef.current = null;
+      emaFastLongRef.current = null;
+      emaSlowLongRef.current = null;
+      rbUpper1Ref.current = null;
+      rbUpper2Ref.current = null;
+      rbUpper3Ref.current = null;
+      rbLower1Ref.current = null;
+      rbLower2Ref.current = null;
+      rbLower3Ref.current = null;
       priceLinesRef.current = [];
+      lastBarsRef.current = [];
     };
   }, [defaultTicker]);
+
+  /**
+   * Recompute every CCA v5 overlay for the given bars and push the resulting
+   * data into the relevant series. Honors the current toggle state — when a
+   * layer is off it's blanked rather than removed (cheaper than tearing
+   * series down on every flip).
+   */
+  function applyBars(bars: Bar[]) {
+    const series = seriesRef.current;
+    if (!series || bars.length === 0) return;
+    lastBarsRef.current = bars;
+
+    const closes = bars.map((b) => b.close);
+    const highs = bars.map((b) => b.high);
+    const lows = bars.map((b) => b.low);
+
+    // 1. HeatMap candle coloring (per-bar). Pine: sensitivity='Medium' uses
+    //    LSMA-smoothed source for the SuperTrend math, but the RSI scheme
+    //    feeds directly off `close` regardless of sensitivity — so we only
+    //    need RSI(14) here. LSMA / SuperTrend math live in cca-v5.ts for
+    //    future signal/cloud expansion.
+    const r = rsi(closes, 14);
+    const candleData: CandlestickData<Time>[] = bars.map((b, i) => {
+      const style = showHeatmapRef.current ? heatmapCandleColor(r[i]) : null;
+      const base: CandlestickData<Time> = {
+        time: b.time as Time,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+      };
+      if (style) {
+        base.color = style.color;
+        base.borderColor = style.borderColor;
+        base.wickColor = style.wickColor;
+      }
+      return base;
+    });
+    series.setData(candleData);
+
+    // 2. EMA Clouds — two pairs (5/12 and 34/50). The Pine fills the gap
+    //    between fast and slow green/red based on fast>slow. We approximate
+    //    that "cloud" by coloring both lines green/red per-bar so the visual
+    //    signal still reads at a glance. (True between-line fills require a
+    //    custom series primitive — punted to v2.)
+    const pairShort = emaPair(closes, 5, 12);
+    const pairLong = emaPair(closes, 34, 50);
+
+    const fastShortData: LineData<Time>[] = [];
+    const slowShortData: LineData<Time>[] = [];
+    const fastLongData: LineData<Time>[] = [];
+    const slowLongData: LineData<Time>[] = [];
+    for (let i = 0; i < bars.length; i++) {
+      const time = bars[i].time as Time;
+      const fs = pairShort.fast[i];
+      const ss = pairShort.slow[i];
+      const fl = pairLong.fast[i];
+      const sl = pairLong.slow[i];
+      const shortColor = Number.isFinite(fs) && Number.isFinite(ss)
+        ? fs > ss
+          ? withAlpha(EMA_GREEN, 0.85)
+          : withAlpha(EMA_RED, 0.85)
+        : undefined;
+      const longColor = Number.isFinite(fl) && Number.isFinite(sl)
+        ? fl > sl
+          ? withAlpha(EMA_GREEN, 0.85)
+          : withAlpha(EMA_RED, 0.85)
+        : undefined;
+      if (Number.isFinite(fs)) fastShortData.push({ time, value: fs, color: shortColor });
+      if (Number.isFinite(ss)) slowShortData.push({ time, value: ss, color: shortColor });
+      if (Number.isFinite(fl)) fastLongData.push({ time, value: fl, color: longColor });
+      if (Number.isFinite(sl)) slowLongData.push({ time, value: sl, color: longColor });
+    }
+
+    if (showEmaCloudsRef.current) {
+      emaFastShortRef.current?.setData(fastShortData);
+      emaSlowShortRef.current?.setData(slowShortData);
+      emaFastLongRef.current?.setData(fastLongData);
+      emaSlowLongRef.current?.setData(slowLongData);
+    } else {
+      emaFastShortRef.current?.setData([]);
+      emaSlowShortRef.current?.setData([]);
+      emaFastLongRef.current?.setData([]);
+      emaSlowLongRef.current?.setData([]);
+    }
+
+    // 3. Reversal Bands — TMA + ATR envelope, six lines.
+    const rb = reversalBands(highs, lows, closes);
+    const pack = (arr: number[]): LineData<Time>[] => {
+      const out: LineData<Time>[] = [];
+      for (let i = 0; i < bars.length; i++) {
+        if (Number.isFinite(arr[i])) out.push({ time: bars[i].time as Time, value: arr[i] });
+      }
+      return out;
+    };
+    if (showReversalBandsRef.current) {
+      rbUpper1Ref.current?.setData(pack(rb.upper1));
+      rbUpper2Ref.current?.setData(pack(rb.upper2));
+      rbUpper3Ref.current?.setData(pack(rb.upper3));
+      rbLower1Ref.current?.setData(pack(rb.lower1));
+      rbLower2Ref.current?.setData(pack(rb.lower2));
+      rbLower3Ref.current?.setData(pack(rb.lower3));
+    } else {
+      rbUpper1Ref.current?.setData([]);
+      rbUpper2Ref.current?.setData([]);
+      rbUpper3Ref.current?.setData([]);
+      rbLower1Ref.current?.setData([]);
+      rbLower2Ref.current?.setData([]);
+      rbLower3Ref.current?.setData([]);
+    }
+  }
 
   // ── Imperative API for Kai's tool dispatcher ──────────────────────────
   useImperativeHandle(
@@ -143,12 +347,12 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
         for (const line of priceLinesRef.current) series.removePriceLine(line);
         priceLinesRef.current = [];
         // Instant paint from sample, then upgrade to live data.
-        series.setData(getBarsFor(SYM));
+        applyBars(getBarsFor(SYM) as Bar[]);
         chartRef.current?.timeScale().fitContent();
         if (tickerRef.current) tickerRef.current.textContent = SYM;
         fetchBars(SYM).then((bars) => {
           if (!seriesRef.current) return;
-          seriesRef.current.setData(bars);
+          applyBars(bars);
           chartRef.current?.timeScale().fitContent();
         });
       },
@@ -170,6 +374,18 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
         if (!series) return;
         for (const line of priceLinesRef.current) series.removePriceLine(line);
         priceLinesRef.current = [];
+      },
+      setHeatmap(on: boolean) {
+        showHeatmapRef.current = on;
+        if (lastBarsRef.current.length > 0) applyBars(lastBarsRef.current);
+      },
+      setEmaClouds(on: boolean) {
+        showEmaCloudsRef.current = on;
+        if (lastBarsRef.current.length > 0) applyBars(lastBarsRef.current);
+      },
+      setReversalBands(on: boolean) {
+        showReversalBandsRef.current = on;
+        if (lastBarsRef.current.length > 0) applyBars(lastBarsRef.current);
       },
     }),
     [],
