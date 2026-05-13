@@ -6,10 +6,7 @@ import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
 import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
 import { audioEngine } from "@/lib/audio-engine";
-import {
-  JarvisChart,
-  type JarvisChartHandle,
-} from "@/components/chart/JarvisChart";
+import { PanelHost, type PanelHostHandle } from "@/components/panel/PanelHost";
 
 // Tool-name → region mapping mirrors the server-side map in
 // src/app/api/chat/route.ts so we can pulse a region the instant a
@@ -148,9 +145,10 @@ export default function Home() {
     stop: () => Promise<Blob>;
   } | null>(null);
 
-  // Chart panel — Kai pulls this up when discussing tickers / levels.
-  const [chartOpen, setChartOpen] = useState(false);
-  const chartRef = useRef<JarvisChartHandle | null>(null);
+  // Multi-panel host — Kai materializes tabs in here when he wants to show
+  // data (chart, quote card, news, earnings, options chain). Each panel
+  // animates in as a tab + body; multiple coexist; user can close any.
+  const panelHostRef = useRef<PanelHostHandle | null>(null);
 
   const modeRef = useRef(mode);
   modeRef.current = mode;
@@ -322,12 +320,17 @@ export default function Home() {
       const playerTask = drainAudioQueue();
 
       try {
-        // Snapshot what's currently on Kway's chart so Kai can see it. Without
-        // this he forgets the ticker on every turn and lies about overlay
-        // toggles. Null when the chart panel isn't open yet.
-        const chartState = chartOpen && chartRef.current
-          ? chartRef.current.getState()
-          : null;
+        // Snapshot what's currently on Kway's panels so Kai can see them.
+        // Chart state lives inside PanelHost — and we also pass the list of
+        // open panel types so Kai doesn't reopen a panel that's already up.
+        const host = panelHostRef.current;
+        const chartHandle = host?.getChartHandle() ?? null;
+        const openPanels = host?.getOpenPanelTypes() ?? [];
+        const chartCore = chartHandle ? chartHandle.getState() : null;
+        const chartState =
+          openPanels.length === 0
+            ? null
+            : { ...(chartCore ?? {}), open_panels: openPanels };
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -378,6 +381,12 @@ export default function Home() {
                   label: string;
                   color: "support" | "resistance" | "neutral";
                 };
+                type PanelTypeArg =
+                  | "chart"
+                  | "quote_card"
+                  | "news"
+                  | "earnings"
+                  | "options_chain";
                 const args = evt.args as
                   | {
                       ticker?: string;
@@ -397,74 +406,104 @@ export default function Home() {
                       start_price?: number;
                       end_date?: string;
                       end_price?: number;
+                      // panel control
+                      panel_type?: PanelTypeArg;
+                      expiry?: string;
                     }
                   | undefined;
-                // Open chart and switch ticker when Kai pulls up technical
-                // context (any tool with chart/ticker/level/score/etc. in name).
+
+                const host = panelHostRef.current;
+                const ensureChart = (ticker?: string) => {
+                  host?.openPanel("chart", ticker ? { ticker } : {});
+                  if (ticker) host?.getChartHandle()?.setTicker(ticker);
+                };
+
+                // ──────────────────────────────────────────────────────────
+                // PANEL CONTROL tools (new — explicit open/close).
+                // ──────────────────────────────────────────────────────────
+                if (n === "show_quote_card") {
+                  host?.openPanel("quote_card", { ticker: args?.ticker });
+                  break;
+                }
+                if (n === "show_news_panel") {
+                  host?.openPanel("news", { ticker: args?.ticker });
+                  break;
+                }
+                if (n === "show_earnings_panel") {
+                  host?.openPanel("earnings", { ticker: args?.ticker });
+                  break;
+                }
+                if (n === "show_options_chain") {
+                  host?.openPanel("options_chain", {
+                    ticker: args?.ticker,
+                    expiry: args?.expiry,
+                  });
+                  break;
+                }
+                if (n === "close_panel") {
+                  if (args?.panel_type) host?.closePanel(args.panel_type);
+                  break;
+                }
+                if (n === "close_all_panels") {
+                  host?.closeAll();
+                  break;
+                }
+
+                // ──────────────────────────────────────────────────────────
+                // Implicit chart panel triggers + existing chart-tool wires.
+                // ──────────────────────────────────────────────────────────
                 if (
                   /(chart|ticker|snapshot|level|technical|score|breakout|pattern)/.test(
                     n,
                   )
                 ) {
-                  setChartOpen(true);
-                  const sym = args?.ticker ?? args?.symbol;
-                  if (sym && chartRef.current) chartRef.current.setTicker(sym);
+                  ensureChart(args?.ticker ?? args?.symbol);
                 }
-                // Kai-driven multi-level chart annotation. Backend
-                // `mark_chart_levels` tool emits:
-                //   { ticker, levels: [{price, label, color}, ...] }
-                //
-                // Lines are drawn one at a time with a ~700ms stagger so the
-                // chart fills in visually as Kai speaks rather than dumping
-                // everything at once. The chart keeps a label→line Map so
-                // Kai can replace a specific level later by calling
-                // mark_chart_levels again with the same label, or wipe just
-                // one via remove_chart_level. We DON'T clearAnnotations()
-                // here — accumulation is the new default.
-                if (/(^|_)(mark_chart_levels|draw_levels|set_chart_levels)$/.test(n)) {
-                  const c = chartRef.current;
-                  if (c) {
-                    setChartOpen(true);
-                    if (args?.ticker) c.setTicker(args.ticker);
-                    if (Array.isArray(args?.levels)) {
-                      args!.levels!.forEach((lvl, i) => {
-                        if (typeof lvl?.price !== "number") return;
-                        setTimeout(() => {
-                          chartRef.current?.drawPriceLine(
-                            lvl.price,
-                            lvl.label ?? `${lvl.price}`,
-                            lvl.color ?? "neutral",
-                          );
-                        }, i * 700);
-                      });
-                    }
+                if (
+                  /(^|_)(mark_chart_levels|draw_levels|set_chart_levels)$/.test(
+                    n,
+                  )
+                ) {
+                  ensureChart(args?.ticker);
+                  if (Array.isArray(args?.levels)) {
+                    args!.levels!.forEach((lvl, i) => {
+                      if (typeof lvl?.price !== "number") return;
+                      setTimeout(() => {
+                        host?.getChartHandle()?.drawPriceLine(
+                          lvl.price,
+                          lvl.label ?? `${lvl.price}`,
+                          lvl.color ?? "neutral",
+                        );
+                      }, i * 700);
+                    });
                   }
                 }
-                // Single-line annotation (kept for ad-hoc draw_line calls).
-                if (/(^|_)(draw_line|draw_price_line|mark_level|add_level)$/.test(n)) {
-                  if (typeof args?.price === "number" && chartRef.current) {
-                    setChartOpen(true);
-                    chartRef.current.drawPriceLine(
+                if (
+                  /(^|_)(draw_line|draw_price_line|mark_level|add_level)$/.test(
+                    n,
+                  )
+                ) {
+                  if (typeof args?.price === "number") {
+                    ensureChart(args?.ticker);
+                    host?.getChartHandle()?.drawPriceLine(
                       args.price,
                       args.label ?? `${args.price}`,
                       args.color ?? "neutral",
                     );
                   }
                 }
-                // Remove a single level by label (Kai changed his mind, or a
-                // level got invalidated mid-conversation).
-                if (/(^|_)(remove_chart_level|remove_level|clear_level)$/.test(n)) {
-                  const label = typeof args?.label === "string" ? args.label : undefined;
-                  if (label) chartRef.current?.removePriceLine(label);
+                if (
+                  /(^|_)(remove_chart_level|remove_level|clear_level)$/.test(n)
+                ) {
+                  const label =
+                    typeof args?.label === "string" ? args.label : undefined;
+                  if (label) host?.getChartHandle()?.removePriceLine(label);
                 }
                 if (/(^|_)(clear_chart|clear_annotations|reset_chart)$/.test(n)) {
-                  chartRef.current?.clearAnnotations();
+                  host?.getChartHandle()?.clearAnnotations();
                 }
-                // Toggle an overlay layer (heatmap candles / EMA clouds /
-                // reversal bands). Lets Kai clean up the chart when an
-                // overlay is fighting the active setup.
                 if (/(^|_)toggle_chart_overlay$/.test(n)) {
-                  const c = chartRef.current;
+                  const c = host?.getChartHandle();
                   const layer = args?.layer;
                   const on = args?.on;
                   if (c && layer && typeof on === "boolean") {
@@ -473,38 +512,41 @@ export default function Home() {
                     else if (layer === "reversal_bands") c.setReversalBands(on);
                   }
                 }
-                // Fibonacci retracement — 7 horizontal lines between a swing
-                // high and a swing low. Chart handles label-keyed cleanup
-                // when the same prefix is reused.
                 if (/(^|_)draw_fib_retracement$/.test(n)) {
-                  const c = chartRef.current;
                   const hi = typeof args?.high === "number" ? args.high : NaN;
                   const lo = typeof args?.low === "number" ? args.low : NaN;
-                  if (c && Number.isFinite(hi) && Number.isFinite(lo) && hi > lo) {
-                    setChartOpen(true);
-                    if (args?.ticker) c.setTicker(args.ticker);
-                    const prefix = typeof args?.label === "string" && args.label.trim() ? args.label.trim() : "fib";
-                    c.drawFibRetracement(hi, lo, prefix);
+                  if (Number.isFinite(hi) && Number.isFinite(lo) && hi > lo) {
+                    ensureChart(args?.ticker);
+                    const prefix =
+                      typeof args?.label === "string" && args.label.trim()
+                        ? args.label.trim()
+                        : "fib";
+                    host?.getChartHandle()?.drawFibRetracement(hi, lo, prefix);
                   }
                 }
                 if (/(^|_)clear_fib_retracement$/.test(n)) {
-                  chartRef.current?.clearFibRetracement();
+                  host?.getChartHandle()?.clearFibRetracement();
                 }
-                // Diagonal trend line between two (date, price) anchors.
                 if (/(^|_)draw_trend_line$/.test(n)) {
-                  const c = chartRef.current;
                   const sd = args?.start_date;
                   const ed = args?.end_date;
-                  const sp = typeof args?.start_price === "number" ? args.start_price : NaN;
-                  const ep = typeof args?.end_price === "number" ? args.end_price : NaN;
-                  const label = typeof args?.label === "string" ? args.label : "";
+                  const sp =
+                    typeof args?.start_price === "number"
+                      ? args.start_price
+                      : NaN;
+                  const ep =
+                    typeof args?.end_price === "number" ? args.end_price : NaN;
+                  const label =
+                    typeof args?.label === "string" ? args.label : "";
                   if (
-                    c && sd && ed && label &&
-                    Number.isFinite(sp) && Number.isFinite(ep)
+                    sd &&
+                    ed &&
+                    label &&
+                    Number.isFinite(sp) &&
+                    Number.isFinite(ep)
                   ) {
-                    setChartOpen(true);
-                    if (args?.ticker) c.setTicker(args.ticker);
-                    c.drawTrendLine(
+                    ensureChart(args?.ticker);
+                    host?.getChartHandle()?.drawTrendLine(
                       { time: sd, price: sp },
                       { time: ed, price: ep },
                       label,
@@ -513,8 +555,9 @@ export default function Home() {
                   }
                 }
                 if (/(^|_)remove_trend_line$/.test(n)) {
-                  const label = typeof args?.label === "string" ? args.label : undefined;
-                  if (label) chartRef.current?.removeTrendLine(label);
+                  const label =
+                    typeof args?.label === "string" ? args.label : undefined;
+                  if (label) host?.getChartHandle()?.removeTrendLine(label);
                 }
                 break;
               }
@@ -792,10 +835,20 @@ export default function Home() {
           <div>v1.1 · hold mic or space to talk</div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setChartOpen((v) => !v)}
+              onClick={() => {
+                const host = panelHostRef.current;
+                if (!host) return;
+                // Toggle the chart panel. If anything is open at all and the
+                // chart is in there, close it; otherwise open it.
+                if (host.getOpenPanelTypes().includes("chart")) {
+                  host.closePanel("chart");
+                } else {
+                  host.openPanel("chart");
+                }
+              }}
               className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white"
             >
-              {chartOpen ? "hide chart" : "show chart"}
+              chart
             </button>
             <button
               onClick={() => setMode(nextMode)}
@@ -810,53 +863,10 @@ export default function Home() {
 
       <KaiBrain />
 
-      {/* Chart panel — slides in from the right when Kai pulls up technical
-          context. Default closed. Manual toggle in the header. */}
-      <section
-        aria-hidden={!chartOpen}
-        className={`absolute top-14 right-0 bottom-0 z-20 w-[46vw] min-w-[420px] max-w-[680px] border-l border-amber-200/15 bg-[#05080A]/92 backdrop-blur-md transition-transform duration-500 ease-out ${
-          chartOpen ? "translate-x-0" : "translate-x-full"
-        }`}
-      >
-        <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              // Simulated Kai-style markup — until backend draw_line tool
-              // ships, this proves the annotation API end-to-end. Will be
-              // removed in Slice 6b when kai-agent-warroom emits real
-              // draw_line tool calls.
-              const c = chartRef.current;
-              if (!c) return;
-              c.clearAnnotations();
-              c.drawPriceLine(495, "R1 · gap fill", "resistance");
-              c.drawPriceLine(485, "yest high", "resistance");
-              c.drawPriceLine(472, "vwap", "neutral");
-              c.drawPriceLine(465, "S1 · 8ema", "support");
-              c.drawPriceLine(458, "S2 · prior break", "support");
-            }}
-            className="rounded-sm border border-amber-300/25 bg-amber-400/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-200 transition hover:bg-amber-400/20"
-          >
-            demo levels
-          </button>
-          <button
-            type="button"
-            onClick={() => chartRef.current?.clearAnnotations()}
-            className="rounded-sm border border-white/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-white/55 transition hover:border-white/30 hover:text-white"
-          >
-            clear
-          </button>
-          <button
-            type="button"
-            onClick={() => setChartOpen(false)}
-            aria-label="close chart"
-            className="rounded-sm border border-white/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-white/55 transition hover:border-white/30 hover:text-white"
-          >
-            close
-          </button>
-        </div>
-        <JarvisChart ref={chartRef} defaultTicker="NVDA" />
-      </section>
+      {/* Multi-panel host — slides in from the right when ANY panel is open.
+          Kai materializes tabs by calling openPanel; user closes via tab X.
+          The chart panel keeps its imperative handle via getChartHandle(). */}
+      <PanelHost ref={panelHostRef} defaultTicker="NVDA" />
 
       <footer className="absolute bottom-0 left-0 right-0 z-10 flex flex-col items-center gap-3 px-4 pb-6 pt-3 pointer-events-none">
         {/* Caption strip */}
