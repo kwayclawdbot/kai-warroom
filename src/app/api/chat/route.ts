@@ -323,6 +323,20 @@ export async function POST(req: Request) {
   const agentUrl = process.env.KAI_AGENT_URL;
   const agentToken = process.env.KAI_AVATAR_TOKEN;
   const openaiKey = process.env.OPENAI_API_KEY;
+  console.log(
+    "[chat:env]",
+    JSON.stringify({
+      has_openai: Boolean(openaiKey),
+      openai_len: openaiKey?.length ?? 0,
+      has_agent_url: Boolean(agentUrl),
+      agent_url_host: agentUrl?.replace(/^https?:\/\//, "").split("/")[0],
+      has_avatar_token: Boolean(agentToken),
+      has_supabase_url: Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL),
+      keys_with_openai_in_name: Object.keys(process.env).filter((k) =>
+        k.toLowerCase().includes("openai"),
+      ),
+    }),
+  );
   if (!openaiKey) {
     return NextResponse.json(
       { error: "OPENAI_API_KEY not configured" },
