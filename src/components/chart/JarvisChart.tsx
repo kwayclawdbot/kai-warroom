@@ -13,6 +13,28 @@ import {
 import { useEffect, useImperativeHandle, useRef, type Ref } from "react";
 import { getBarsFor } from "@/lib/chart/sample-data";
 
+type Bar = { time: string; open: number; high: number; low: number; close: number };
+
+/**
+ * Fetch live daily OHLC from /api/chart-bars (which proxies Polygon with a
+ * 60s in-memory cache). Falls back to sample-data on any error so the panel
+ * never goes blank during dev or rate-limit hiccups.
+ */
+async function fetchBars(symbol: string): Promise<Bar[]> {
+  try {
+    const res = await fetch(`/api/chart-bars?symbol=${encodeURIComponent(symbol)}&days=180`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = (await res.json()) as { bars?: Bar[] };
+    if (Array.isArray(json.bars) && json.bars.length > 0) return json.bars;
+    throw new Error("empty bars");
+  } catch (e) {
+    console.warn(`[chart] live bars failed for ${symbol}, using sample`, e);
+    return getBarsFor(symbol) as Bar[];
+  }
+}
+
 /**
  * Imperative handle exposed to Kai's tool-call dispatcher. The frontend host
  * calls these methods when Kai's NDJSON stream emits matching tool events:
@@ -89,12 +111,19 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
     chartRef.current = chart;
     seriesRef.current = candles;
 
-    // Seed initial data
+    // Seed with sample for instant paint, then upgrade to live Polygon data.
     candles.setData(getBarsFor(defaultTicker));
     chart.timeScale().fitContent();
     if (tickerRef.current) tickerRef.current.textContent = defaultTicker;
+    let cancelled = false;
+    fetchBars(defaultTicker).then((bars) => {
+      if (cancelled || !seriesRef.current) return;
+      seriesRef.current.setData(bars);
+      chartRef.current?.timeScale().fitContent();
+    });
 
     return () => {
+      cancelled = true;
       chart.remove();
       chartRef.current = null;
       seriesRef.current = null;
@@ -109,12 +138,19 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       setTicker(symbol: string) {
         const series = seriesRef.current;
         if (!series) return;
+        const SYM = symbol.toUpperCase();
         // Clear previous annotations on ticker change
         for (const line of priceLinesRef.current) series.removePriceLine(line);
         priceLinesRef.current = [];
-        series.setData(getBarsFor(symbol));
+        // Instant paint from sample, then upgrade to live data.
+        series.setData(getBarsFor(SYM));
         chartRef.current?.timeScale().fitContent();
-        if (tickerRef.current) tickerRef.current.textContent = symbol.toUpperCase();
+        if (tickerRef.current) tickerRef.current.textContent = SYM;
+        fetchBars(SYM).then((bars) => {
+          if (!seriesRef.current) return;
+          seriesRef.current.setData(bars);
+          chartRef.current?.timeScale().fitContent();
+        });
       },
       drawPriceLine(price, label, color = "neutral") {
         const series = seriesRef.current;
