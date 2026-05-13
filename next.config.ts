@@ -57,12 +57,15 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
-        // Override must come BEFORE the catch-all so Next merges per-route.
         source: "/design-preview/:path*",
         headers: DESIGN_PREVIEW_HEADERS,
       },
       {
-        source: "/:path*",
+        // Catch-all that EXCLUDES /design-preview so its loosened CSP isn't
+        // overwritten by the strict app CSP. Without the negative-lookahead,
+        // both rules match /design-preview/* and Next.js merges them in order,
+        // with the later (strict) rule winning the CSP key.
+        source: "/((?!design-preview).*)",
         headers: SECURITY_HEADERS,
       },
     ];
