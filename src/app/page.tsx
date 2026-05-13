@@ -393,26 +393,35 @@ export default function Home() {
                 // Kai-driven multi-level chart annotation. Backend
                 // `mark_chart_levels` tool emits:
                 //   { ticker, levels: [{price, label, color}, ...] }
+                //
+                // Lines are drawn one at a time with a ~700ms stagger so the
+                // chart fills in visually as Kai speaks rather than dumping
+                // everything at once. The chart keeps a label→line Map so
+                // Kai can replace a specific level later by calling
+                // mark_chart_levels again with the same label, or wipe just
+                // one via remove_chart_level. We DON'T clearAnnotations()
+                // here — accumulation is the new default.
                 if (/(^|_)(mark_chart_levels|draw_levels|set_chart_levels)$/.test(n)) {
                   const c = chartRef.current;
                   if (c) {
                     setChartOpen(true);
                     if (args?.ticker) c.setTicker(args.ticker);
-                    c.clearAnnotations();
                     if (Array.isArray(args?.levels)) {
-                      for (const lvl of args!.levels!) {
-                        if (typeof lvl?.price !== "number") continue;
-                        c.drawPriceLine(
-                          lvl.price,
-                          lvl.label ?? `${lvl.price}`,
-                          lvl.color ?? "neutral",
-                        );
-                      }
+                      args!.levels!.forEach((lvl, i) => {
+                        if (typeof lvl?.price !== "number") return;
+                        setTimeout(() => {
+                          chartRef.current?.drawPriceLine(
+                            lvl.price,
+                            lvl.label ?? `${lvl.price}`,
+                            lvl.color ?? "neutral",
+                          );
+                        }, i * 700);
+                      });
                     }
                   }
                 }
                 // Single-line annotation (kept for ad-hoc draw_line calls).
-                if (/(^|_)(draw_line|draw_price_line|mark_level)$/.test(n)) {
+                if (/(^|_)(draw_line|draw_price_line|mark_level|add_level)$/.test(n)) {
                   if (typeof args?.price === "number" && chartRef.current) {
                     setChartOpen(true);
                     chartRef.current.drawPriceLine(
@@ -421,6 +430,12 @@ export default function Home() {
                       args.color ?? "neutral",
                     );
                   }
+                }
+                // Remove a single level by label (Kai changed his mind, or a
+                // level got invalidated mid-conversation).
+                if (/(^|_)(remove_chart_level|remove_level|clear_level)$/.test(n)) {
+                  const label = typeof args?.label === "string" ? args.label : undefined;
+                  if (label) chartRef.current?.removePriceLine(label);
                 }
                 if (/(^|_)(clear_chart|clear_annotations|reset_chart)$/.test(n)) {
                   chartRef.current?.clearAnnotations();

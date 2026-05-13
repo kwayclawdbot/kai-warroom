@@ -66,6 +66,7 @@ export type JarvisChartHandle = {
     label: string,
     color?: "support" | "resistance" | "neutral",
   ) => void;
+  removePriceLine: (label: string) => void;
   clearAnnotations: () => void;
   setHeatmap: (on: boolean) => void;
   setEmaClouds: (on: boolean) => void;
@@ -77,30 +78,54 @@ type Props = {
   defaultTicker?: string;
 };
 
-const PRICE_LINE_COLORS = {
-  support: "#34d399",      // emerald
-  resistance: "#f87171",   // red
-  neutral: "#fbbf24",      // amber (matches warroom palette)
+// All overlay tones below are pulled directly from the SH1 heatmap candle
+// gradient (src/lib/chart/cca-v5.ts SH1_COLORS_RAW), so every layer of the
+// chart — candles, EMA clouds, reversal bands, and Kai's level annotations —
+// belongs to one unified palette. Mental model: warm = bearish / overbought-
+// resistance, cool/green = bullish / oversold-support, amber = neutral.
+const PALETTE = {
+  greenStrong: "#1fa237",   // strong bullish (palette green)
+  greenTeal: "#1ea780",     // bullish, lighter
+  blueDeep: "#0080ff",      // overbought blue (palette top)
+  blueMid: "#0e89cb",       // softer blue
+  amber: "#dca100",         // neutral mid-gradient
+  amberLight: "#d3ac00",
+  orange: "#f07e00",        // warm warning
+  redBright: "#ff1e00",     // bearish red
+  redDeep: "#ff0000",       // extreme red
 } as const;
 
-// Cloud line tones, low-alpha so the heatmap candles remain the focal point.
-const EMA_GREEN = "#22c55e";
-const EMA_RED = "#ef4444";
-// Reversal Band tones — match Pine palette (yellow/red upper, blue/green lower).
+const PRICE_LINE_COLORS = {
+  support: PALETTE.greenStrong,
+  resistance: PALETTE.redBright,
+  neutral: PALETTE.amber,
+} as const;
+
+// EMA Clouds — green when fast > slow, red when fast < slow. Match heatmap
+// bullish/bearish tones exactly.
+const EMA_GREEN = PALETTE.greenStrong;
+const EMA_RED = PALETTE.redBright;
+
+// Reversal Bands — gradient from gentle to extreme. Upper warns of
+// overheated; lower flags oversold/extended low.
 const RB_COLORS = {
-  upper1: withAlpha("#facc15", 0.55), // yellow inner
-  upper2: withAlpha("#ef4444", 0.55), // red inner
-  upper3: withAlpha("#ef4444", 0.85), // red outer (brighter)
-  lower1: withAlpha("#3b82f6", 0.55), // blue inner
-  lower2: withAlpha("#3b82f6", 0.85), // blue outer
-  lower3: withAlpha("#22c55e", 0.55), // green outer
+  upper1: withAlpha(PALETTE.amber, 0.55),       // gentle warning (amber)
+  upper2: withAlpha(PALETTE.orange, 0.55),      // real warning (orange)
+  upper3: withAlpha(PALETTE.redBright, 0.85),   // extreme (red)
+  lower1: withAlpha(PALETTE.greenStrong, 0.55), // gentle support (green)
+  lower2: withAlpha(PALETTE.blueMid, 0.55),     // stretched (teal-blue)
+  lower3: withAlpha(PALETTE.blueDeep, 0.85),    // oversold extreme (blue)
 };
 
 export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const priceLinesRef = useRef<IPriceLine[]>([]);
+  // Track price lines by their label so Kai can actively add/remove/replace
+  // specific levels mid-conversation instead of wiping and re-drawing every
+  // time. Lowercased label is the key — Kai's label vocabulary is short
+  // ("R1", "vwap", "8ema", "entry", "stop") and case sometimes drifts.
+  const priceLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const tickerRef = useRef<HTMLSpanElement>(null);
 
   // CCA v5 overlay series + state. Kept in refs so toggles can re-skin the
@@ -219,7 +244,7 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       rbLower1Ref.current = null;
       rbLower2Ref.current = null;
       rbLower3Ref.current = null;
-      priceLinesRef.current = [];
+      priceLinesRef.current.clear();
       lastBarsRef.current = [];
     };
   }, [defaultTicker]);
@@ -343,9 +368,9 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
         const series = seriesRef.current;
         if (!series) return;
         const SYM = symbol.toUpperCase();
-        // Clear previous annotations on ticker change
-        for (const line of priceLinesRef.current) series.removePriceLine(line);
-        priceLinesRef.current = [];
+        // Clear previous annotations on ticker change.
+        for (const line of priceLinesRef.current.values()) series.removePriceLine(line);
+        priceLinesRef.current.clear();
         // Instant paint from sample, then upgrade to live data.
         applyBars(getBarsFor(SYM) as Bar[]);
         chartRef.current?.timeScale().fitContent();
@@ -359,6 +384,15 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       drawPriceLine(price, label, color = "neutral") {
         const series = seriesRef.current;
         if (!series) return;
+        const key = label.toLowerCase().trim();
+        // Replace any line with the same label so Kai can update a level
+        // ("actually the real support is 32") without leaving the old one
+        // floating on the chart.
+        const existing = priceLinesRef.current.get(key);
+        if (existing) {
+          series.removePriceLine(existing);
+          priceLinesRef.current.delete(key);
+        }
         const line = series.createPriceLine({
           price,
           color: PRICE_LINE_COLORS[color],
@@ -367,13 +401,23 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
           axisLabelVisible: true,
           title: label,
         });
-        priceLinesRef.current.push(line);
+        priceLinesRef.current.set(key, line);
+      },
+      removePriceLine(label: string) {
+        const series = seriesRef.current;
+        if (!series) return;
+        const key = label.toLowerCase().trim();
+        const existing = priceLinesRef.current.get(key);
+        if (existing) {
+          series.removePriceLine(existing);
+          priceLinesRef.current.delete(key);
+        }
       },
       clearAnnotations() {
         const series = seriesRef.current;
         if (!series) return;
-        for (const line of priceLinesRef.current) series.removePriceLine(line);
-        priceLinesRef.current = [];
+        for (const line of priceLinesRef.current.values()) series.removePriceLine(line);
+        priceLinesRef.current.clear();
       },
       setHeatmap(on: boolean) {
         showHeatmapRef.current = on;
