@@ -71,6 +71,20 @@ export type JarvisChartHandle = {
   setHeatmap: (on: boolean) => void;
   setEmaClouds: (on: boolean) => void;
   setReversalBands: (on: boolean) => void;
+  // Fibonacci retracement — internally renders 7 price lines using
+  // drawPriceLine with `fib <pct>` labels. clearFibRetracement removes any
+  // price line whose label starts with the fib prefix.
+  drawFibRetracement: (high: number, low: number, labelPrefix?: string) => void;
+  clearFibRetracement: () => void;
+  // Two-point diagonal trend lines. Replace-by-label semantics like price
+  // lines; removeTrendLine yanks one by label.
+  drawTrendLine: (
+    start: { time: string; price: number },
+    end: { time: string; price: number },
+    label: string,
+    color?: "support" | "resistance" | "neutral",
+  ) => void;
+  removeTrendLine: (label: string) => void;
 };
 
 type Props = {
@@ -126,6 +140,12 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
   // time. Lowercased label is the key — Kai's label vocabulary is short
   // ("R1", "vwap", "8ema", "entry", "stop") and case sometimes drifts.
   const priceLinesRef = useRef<Map<string, IPriceLine>>(new Map());
+  // Tracks labels that belong to a fib retracement so clearFibRetracement can
+  // remove exactly those (and only those) without touching ad-hoc levels.
+  const fibLabelsRef = useRef<Set<string>>(new Set());
+  // Trend lines render as their own 2-point LineSeries (price lines can only
+  // be horizontal). Keyed by lowercased label so Kai can replace by name.
+  const trendLinesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const tickerRef = useRef<HTMLSpanElement>(null);
 
   // CCA v5 overlay series + state. Kept in refs so toggles can re-skin the
@@ -245,6 +265,8 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       rbLower2Ref.current = null;
       rbLower3Ref.current = null;
       priceLinesRef.current.clear();
+      fibLabelsRef.current.clear();
+      trendLinesRef.current.clear();
       lastBarsRef.current = [];
     };
   }, [defaultTicker]);
@@ -366,14 +388,22 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
     () => ({
       setTicker(symbol: string) {
         const series = seriesRef.current;
-        if (!series) return;
+        const chart = chartRef.current;
+        if (!series || !chart) return;
         const SYM = symbol.toUpperCase();
         // Clear previous annotations on ticker change.
         for (const line of priceLinesRef.current.values()) series.removePriceLine(line);
         priceLinesRef.current.clear();
+        fibLabelsRef.current.clear();
+        // Trend lines anchor to dates on the previous ticker — also stale on
+        // ticker change.
+        for (const s of trendLinesRef.current.values()) {
+          try { chart.removeSeries(s); } catch { /* noop */ }
+        }
+        trendLinesRef.current.clear();
         // Instant paint from sample, then upgrade to live data.
         applyBars(getBarsFor(SYM) as Bar[]);
-        chartRef.current?.timeScale().fitContent();
+        chart.timeScale().fitContent();
         if (tickerRef.current) tickerRef.current.textContent = SYM;
         fetchBars(SYM).then((bars) => {
           if (!seriesRef.current) return;
@@ -392,6 +422,7 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
         if (existing) {
           series.removePriceLine(existing);
           priceLinesRef.current.delete(key);
+          fibLabelsRef.current.delete(key);
         }
         const line = series.createPriceLine({
           price,
@@ -411,13 +442,23 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
         if (existing) {
           series.removePriceLine(existing);
           priceLinesRef.current.delete(key);
+          fibLabelsRef.current.delete(key);
         }
       },
       clearAnnotations() {
         const series = seriesRef.current;
+        const chart = chartRef.current;
         if (!series) return;
         for (const line of priceLinesRef.current.values()) series.removePriceLine(line);
         priceLinesRef.current.clear();
+        fibLabelsRef.current.clear();
+        // clearAnnotations is the nuclear option — also yank trend lines.
+        if (chart) {
+          for (const s of trendLinesRef.current.values()) {
+            try { chart.removeSeries(s); } catch { /* noop */ }
+          }
+        }
+        trendLinesRef.current.clear();
       },
       setHeatmap(on: boolean) {
         showHeatmapRef.current = on;
@@ -430,6 +471,95 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
       setReversalBands(on: boolean) {
         showReversalBandsRef.current = on;
         if (lastBarsRef.current.length > 0) applyBars(lastBarsRef.current);
+      },
+      drawFibRetracement(high: number, low: number, labelPrefix = "fib") {
+        const series = seriesRef.current;
+        if (!series || !(high > low)) return;
+        const prefix = (labelPrefix || "fib").trim() || "fib";
+        const range = high - low;
+        // Standard 7 fib retracement levels. Color graded by depth so the
+        // 50% line reads as the visual anchor, with shallow / deep pulls
+        // shading toward support/resistance tones.
+        const RATIOS: Array<{ pct: number; color: "support" | "resistance" | "neutral" }> = [
+          { pct: 0,    color: "resistance" }, // top (swing high)
+          { pct: 23.6, color: "resistance" }, // shallow pullback
+          { pct: 38.2, color: "neutral" },    // mild retracement
+          { pct: 50,   color: "neutral" },    // golden mean
+          { pct: 61.8, color: "neutral" },    // golden ratio (key)
+          { pct: 78.6, color: "support" },    // deep retracement
+          { pct: 100,  color: "support" },    // bottom (swing low)
+        ];
+        for (const r of RATIOS) {
+          const price = high - (range * (r.pct / 100));
+          // Trim to avoid "fib 61.8000000" floats — pct is finite-precision.
+          const pctLabel = Number.isInteger(r.pct) ? `${r.pct}` : r.pct.toFixed(1);
+          const label = `${prefix} ${pctLabel}`;
+          const key = label.toLowerCase().trim();
+          const existing = priceLinesRef.current.get(key);
+          if (existing) {
+            series.removePriceLine(existing);
+            priceLinesRef.current.delete(key);
+          }
+          const line = series.createPriceLine({
+            price,
+            color: PRICE_LINE_COLORS[r.color],
+            lineWidth: 1,
+            lineStyle: LineStyle.Dotted,
+            axisLabelVisible: true,
+            title: label,
+          });
+          priceLinesRef.current.set(key, line);
+          fibLabelsRef.current.add(key);
+        }
+      },
+      clearFibRetracement() {
+        const series = seriesRef.current;
+        if (!series) return;
+        for (const key of fibLabelsRef.current) {
+          const existing = priceLinesRef.current.get(key);
+          if (existing) {
+            series.removePriceLine(existing);
+            priceLinesRef.current.delete(key);
+          }
+        }
+        fibLabelsRef.current.clear();
+      },
+      drawTrendLine(start, end, label, color = "neutral") {
+        const chart = chartRef.current;
+        if (!chart) return;
+        const key = label.toLowerCase().trim();
+        // Replace by label so Kai can update a trend line in place.
+        const existing = trendLinesRef.current.get(key);
+        if (existing) {
+          try { chart.removeSeries(existing); } catch { /* noop */ }
+          trendLinesRef.current.delete(key);
+        }
+        const series = chart.addSeries(LineSeries, {
+          color: PRICE_LINE_COLORS[color],
+          lineWidth: 2,
+          lineStyle: LineStyle.Solid,
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
+          title: label,
+        });
+        // 2-point series — lightweight-charts draws a straight line between
+        // them. Times must be sorted ascending.
+        const a = { time: start.time as Time, value: start.price };
+        const b = { time: end.time as Time, value: end.price };
+        const data: LineData<Time>[] = start.time <= end.time ? [a, b] : [b, a];
+        series.setData(data);
+        trendLinesRef.current.set(key, series);
+      },
+      removeTrendLine(label: string) {
+        const chart = chartRef.current;
+        if (!chart) return;
+        const key = label.toLowerCase().trim();
+        const existing = trendLinesRef.current.get(key);
+        if (existing) {
+          try { chart.removeSeries(existing); } catch { /* noop */ }
+          trendLinesRef.current.delete(key);
+        }
       },
     }),
     [],

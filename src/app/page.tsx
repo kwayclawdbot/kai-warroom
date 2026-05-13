@@ -377,6 +377,17 @@ export default function Home() {
                       label?: string;
                       color?: "support" | "resistance" | "neutral";
                       levels?: Level[];
+                      // toggle_chart_overlay
+                      layer?: "heatmap" | "ema_clouds" | "reversal_bands";
+                      on?: boolean;
+                      // draw_fib_retracement
+                      high?: number;
+                      low?: number;
+                      // draw_trend_line
+                      start_date?: string;
+                      start_price?: number;
+                      end_date?: string;
+                      end_price?: number;
                     }
                   | undefined;
                 // Open chart and switch ticker when Kai pulls up technical
@@ -439,6 +450,62 @@ export default function Home() {
                 }
                 if (/(^|_)(clear_chart|clear_annotations|reset_chart)$/.test(n)) {
                   chartRef.current?.clearAnnotations();
+                }
+                // Toggle an overlay layer (heatmap candles / EMA clouds /
+                // reversal bands). Lets Kai clean up the chart when an
+                // overlay is fighting the active setup.
+                if (/(^|_)toggle_chart_overlay$/.test(n)) {
+                  const c = chartRef.current;
+                  const layer = args?.layer;
+                  const on = args?.on;
+                  if (c && layer && typeof on === "boolean") {
+                    if (layer === "heatmap") c.setHeatmap(on);
+                    else if (layer === "ema_clouds") c.setEmaClouds(on);
+                    else if (layer === "reversal_bands") c.setReversalBands(on);
+                  }
+                }
+                // Fibonacci retracement — 7 horizontal lines between a swing
+                // high and a swing low. Chart handles label-keyed cleanup
+                // when the same prefix is reused.
+                if (/(^|_)draw_fib_retracement$/.test(n)) {
+                  const c = chartRef.current;
+                  const hi = typeof args?.high === "number" ? args.high : NaN;
+                  const lo = typeof args?.low === "number" ? args.low : NaN;
+                  if (c && Number.isFinite(hi) && Number.isFinite(lo) && hi > lo) {
+                    setChartOpen(true);
+                    if (args?.ticker) c.setTicker(args.ticker);
+                    const prefix = typeof args?.label === "string" && args.label.trim() ? args.label.trim() : "fib";
+                    c.drawFibRetracement(hi, lo, prefix);
+                  }
+                }
+                if (/(^|_)clear_fib_retracement$/.test(n)) {
+                  chartRef.current?.clearFibRetracement();
+                }
+                // Diagonal trend line between two (date, price) anchors.
+                if (/(^|_)draw_trend_line$/.test(n)) {
+                  const c = chartRef.current;
+                  const sd = args?.start_date;
+                  const ed = args?.end_date;
+                  const sp = typeof args?.start_price === "number" ? args.start_price : NaN;
+                  const ep = typeof args?.end_price === "number" ? args.end_price : NaN;
+                  const label = typeof args?.label === "string" ? args.label : "";
+                  if (
+                    c && sd && ed && label &&
+                    Number.isFinite(sp) && Number.isFinite(ep)
+                  ) {
+                    setChartOpen(true);
+                    if (args?.ticker) c.setTicker(args.ticker);
+                    c.drawTrendLine(
+                      { time: sd, price: sp },
+                      { time: ed, price: ep },
+                      label,
+                      args?.color ?? "neutral",
+                    );
+                  }
+                }
+                if (/(^|_)remove_trend_line$/.test(n)) {
+                  const label = typeof args?.label === "string" ? args.label : undefined;
+                  if (label) chartRef.current?.removeTrendLine(label);
                 }
                 break;
               }
