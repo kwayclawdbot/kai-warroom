@@ -330,7 +330,7 @@ export async function POST(req: Request) {
     );
   }
 
-  let body: { message?: string };
+  let body: { message?: string; chart_state?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -340,6 +340,9 @@ export async function POST(req: Request) {
   if (!message) {
     return NextResponse.json({ error: "empty message" }, { status: 400 });
   }
+  // Forwarded as-is to the kai-agent so the prompt can show the model what's
+  // currently on the user's chart. Shape lives in JarvisChartHandle.getState.
+  const chartState = body.chart_state ?? null;
 
   const intent = classifyIntent(message);
   console.log(
@@ -392,6 +395,7 @@ export async function POST(req: Request) {
     agentUrl,
     agentToken,
     userId,
+    chartState,
   });
 }
 
@@ -401,6 +405,7 @@ interface AgentConfig {
   agentUrl: string;
   agentToken: string;
   userId: string;
+  chartState: unknown;
 }
 
 /**
@@ -470,6 +475,7 @@ async function streamData(
       user_id: cfg.userId,
       message,
       channel: "avatar",
+      chart_state: cfg.chartState,
     }),
   });
   const fillerTextPromise = generateContextualFiller(openai, message);

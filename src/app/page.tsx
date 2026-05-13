@@ -322,10 +322,19 @@ export default function Home() {
       const playerTask = drainAudioQueue();
 
       try {
+        // Snapshot what's currently on Kway's chart so Kai can see it. Without
+        // this he forgets the ticker on every turn and lies about overlay
+        // toggles. Null when the chart panel isn't open yet.
+        const chartState = chartOpen && chartRef.current
+          ? chartRef.current.getState()
+          : null;
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: message.trim() }),
+          body: JSON.stringify({
+            message: message.trim(),
+            chart_state: chartState,
+          }),
         });
         if (!res.ok || !res.body) {
           const body = await res

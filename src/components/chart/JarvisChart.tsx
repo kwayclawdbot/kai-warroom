@@ -85,6 +85,20 @@ export type JarvisChartHandle = {
     color?: "support" | "resistance" | "neutral",
   ) => void;
   removeTrendLine: (label: string) => void;
+  // Snapshot of everything currently on the chart, so the backend agent can
+  // see what Kway is looking at instead of guessing. Sent with every chat
+  // message via /api/chat → kai-agent.
+  getState: () => {
+    ticker: string | null;
+    overlays: {
+      heatmap: boolean;
+      ema_clouds: boolean;
+      reversal_bands: boolean;
+    };
+    levels: Array<{ label: string; price: number }>;
+    trend_lines: string[];
+    fib_active: boolean;
+  };
 };
 
 type Props = {
@@ -560,6 +574,31 @@ export function JarvisChart({ ref, defaultTicker = "NVDA" }: Props) {
           try { chart.removeSeries(existing); } catch { /* noop */ }
           trendLinesRef.current.delete(key);
         }
+      },
+      getState() {
+        const ticker = tickerRef.current?.textContent?.trim() || null;
+        const levels: Array<{ label: string; price: number }> = [];
+        for (const [key, line] of priceLinesRef.current.entries()) {
+          // IPriceLine.options() exposes price + title from creation opts.
+          try {
+            const opts = line.options();
+            const label = (opts.title as string | undefined) ?? key;
+            levels.push({ label, price: opts.price });
+          } catch {
+            /* skip lines whose options API isn't reachable */
+          }
+        }
+        return {
+          ticker,
+          overlays: {
+            heatmap: showHeatmapRef.current,
+            ema_clouds: showEmaCloudsRef.current,
+            reversal_bands: showReversalBandsRef.current,
+          },
+          levels,
+          trend_lines: Array.from(trendLinesRef.current.keys()),
+          fib_active: fibLabelsRef.current.size > 0,
+        };
       },
     }),
     [],
