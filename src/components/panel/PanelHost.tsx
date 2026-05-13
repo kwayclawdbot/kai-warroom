@@ -153,12 +153,13 @@ export const PanelHost = forwardRef<PanelHostHandle, { defaultTicker?: string }>
     return (
       <section
         aria-hidden={!isOpen}
-        className={`absolute top-14 right-0 bottom-0 z-20 w-[46vw] min-w-[420px] max-w-[680px] border-l border-amber-200/15 bg-[#05080A]/92 backdrop-blur-md transition-transform duration-500 ease-out ${
+        className={`absolute top-14 right-0 bottom-0 z-20 w-full md:w-[46vw] md:min-w-[420px] md:max-w-[680px] border-l border-amber-200/15 bg-[#05080A]/92 backdrop-blur-md transition-transform duration-500 ease-out ${
           isOpen ? "translate-x-0" : "translate-x-full"
         }`}
       >
-        {/* Tab strip */}
-        <div className="flex h-10 items-end gap-1 border-b border-amber-200/10 px-2 pt-2">
+        {/* Tab strip — horizontally scrollable on mobile when many tabs are
+            open; on desktop the panel is wide enough to fit a few. */}
+        <div className="flex h-10 items-end gap-1 overflow-x-auto overflow-y-hidden border-b border-amber-200/10 px-2 pt-2 [&::-webkit-scrollbar]:hidden">
           <AnimatePresence initial={false}>
             {panels.map((p) => {
               const active = p.id === activeId;
