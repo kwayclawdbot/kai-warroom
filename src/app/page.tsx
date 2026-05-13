@@ -6,6 +6,10 @@ import { REGIONS, type RegionId } from "@/lib/brain-regions";
 import { useAvatar } from "@/lib/avatar-store";
 import { SPEECH_PROGRAM, speakingEnvelope } from "@/lib/speech-script";
 import { audioEngine } from "@/lib/audio-engine";
+import {
+  JarvisChart,
+  type JarvisChartHandle,
+} from "@/components/chart/JarvisChart";
 
 // Tool-name → region mapping mirrors the server-side map in
 // src/app/api/chat/route.ts so we can pulse a region the instant a
@@ -143,6 +147,10 @@ export default function Home() {
   const recorderRef = useRef<{
     stop: () => Promise<Blob>;
   } | null>(null);
+
+  // Chart panel — Kai pulls this up when discussing tickers / levels.
+  const [chartOpen, setChartOpen] = useState(false);
+  const chartRef = useRef<JarvisChartHandle | null>(null);
 
   const modeRef = useRef(mode);
   modeRef.current = mode;
@@ -355,6 +363,68 @@ export default function Home() {
               case "tool_start": {
                 const region = toolToRegion(evt.name);
                 if (region) pulseRegion(region, 0.9, 2200);
+                const n = evt.name.toLowerCase();
+                type Level = {
+                  price: number;
+                  label: string;
+                  color: "support" | "resistance" | "neutral";
+                };
+                const args = evt.args as
+                  | {
+                      ticker?: string;
+                      symbol?: string;
+                      price?: number;
+                      label?: string;
+                      color?: "support" | "resistance" | "neutral";
+                      levels?: Level[];
+                    }
+                  | undefined;
+                // Open chart and switch ticker when Kai pulls up technical
+                // context (any tool with chart/ticker/level/score/etc. in name).
+                if (
+                  /(chart|ticker|snapshot|level|technical|score|breakout|pattern)/.test(
+                    n,
+                  )
+                ) {
+                  setChartOpen(true);
+                  const sym = args?.ticker ?? args?.symbol;
+                  if (sym && chartRef.current) chartRef.current.setTicker(sym);
+                }
+                // Kai-driven multi-level chart annotation. Backend
+                // `mark_chart_levels` tool emits:
+                //   { ticker, levels: [{price, label, color}, ...] }
+                if (/(^|_)(mark_chart_levels|draw_levels|set_chart_levels)$/.test(n)) {
+                  const c = chartRef.current;
+                  if (c) {
+                    setChartOpen(true);
+                    if (args?.ticker) c.setTicker(args.ticker);
+                    c.clearAnnotations();
+                    if (Array.isArray(args?.levels)) {
+                      for (const lvl of args!.levels!) {
+                        if (typeof lvl?.price !== "number") continue;
+                        c.drawPriceLine(
+                          lvl.price,
+                          lvl.label ?? `${lvl.price}`,
+                          lvl.color ?? "neutral",
+                        );
+                      }
+                    }
+                  }
+                }
+                // Single-line annotation (kept for ad-hoc draw_line calls).
+                if (/(^|_)(draw_line|draw_price_line|mark_level)$/.test(n)) {
+                  if (typeof args?.price === "number" && chartRef.current) {
+                    setChartOpen(true);
+                    chartRef.current.drawPriceLine(
+                      args.price,
+                      args.label ?? `${args.price}`,
+                      args.color ?? "neutral",
+                    );
+                  }
+                }
+                if (/(^|_)(clear_chart|clear_annotations|reset_chart)$/.test(n)) {
+                  chartRef.current?.clearAnnotations();
+                }
                 break;
               }
               case "tool_end":
@@ -629,17 +699,73 @@ export default function Home() {
         </div>
         <div className="flex flex-col items-end gap-1 text-[10px] uppercase tracking-[0.2em] text-amber-200/70 font-mono">
           <div>v1.1 · hold mic or space to talk</div>
-          <button
-            onClick={() => setMode(nextMode)}
-            disabled={chatPlaying || chatLoading || recording || transcribing}
-            className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white disabled:opacity-40 disabled:hover:border-white/15"
-          >
-            {MODE_LABELS[mode]}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setChartOpen((v) => !v)}
+              className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white"
+            >
+              {chartOpen ? "hide chart" : "show chart"}
+            </button>
+            <button
+              onClick={() => setMode(nextMode)}
+              disabled={chatPlaying || chatLoading || recording || transcribing}
+              className="rounded-sm border border-white/15 px-2.5 py-0.5 text-white/65 transition hover:border-white/40 hover:text-white disabled:opacity-40 disabled:hover:border-white/15"
+            >
+              {MODE_LABELS[mode]}
+            </button>
+          </div>
         </div>
       </header>
 
       <KaiBrain />
+
+      {/* Chart panel — slides in from the right when Kai pulls up technical
+          context. Default closed. Manual toggle in the header. */}
+      <section
+        aria-hidden={!chartOpen}
+        className={`absolute top-14 right-0 bottom-0 z-20 w-[46vw] min-w-[420px] max-w-[680px] border-l border-amber-200/15 bg-[#05080A]/92 backdrop-blur-md transition-transform duration-500 ease-out ${
+          chartOpen ? "translate-x-0" : "translate-x-full"
+        }`}
+      >
+        <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              // Simulated Kai-style markup — until backend draw_line tool
+              // ships, this proves the annotation API end-to-end. Will be
+              // removed in Slice 6b when kai-agent-warroom emits real
+              // draw_line tool calls.
+              const c = chartRef.current;
+              if (!c) return;
+              c.clearAnnotations();
+              c.drawPriceLine(495, "R1 · gap fill", "resistance");
+              c.drawPriceLine(485, "yest high", "resistance");
+              c.drawPriceLine(472, "vwap", "neutral");
+              c.drawPriceLine(465, "S1 · 8ema", "support");
+              c.drawPriceLine(458, "S2 · prior break", "support");
+            }}
+            className="rounded-sm border border-amber-300/25 bg-amber-400/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-200 transition hover:bg-amber-400/20"
+          >
+            demo levels
+          </button>
+          <button
+            type="button"
+            onClick={() => chartRef.current?.clearAnnotations()}
+            className="rounded-sm border border-white/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-white/55 transition hover:border-white/30 hover:text-white"
+          >
+            clear
+          </button>
+          <button
+            type="button"
+            onClick={() => setChartOpen(false)}
+            aria-label="close chart"
+            className="rounded-sm border border-white/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-white/55 transition hover:border-white/30 hover:text-white"
+          >
+            close
+          </button>
+        </div>
+        <JarvisChart ref={chartRef} defaultTicker="NVDA" />
+      </section>
 
       <footer className="absolute bottom-0 left-0 right-0 z-10 flex flex-col items-center gap-3 px-4 pb-6 pt-3 pointer-events-none">
         {/* Caption strip */}
